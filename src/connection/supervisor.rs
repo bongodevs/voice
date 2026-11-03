@@ -343,13 +343,24 @@ where
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|since| since.as_millis() as u64)
                     .unwrap_or(0);
-                if let Err(reason) = queue_outbound(&write_tx, heartbeat_message(t, *last_seq)) {
+                if let Err(reason) =
+                    queue_outbound(&write_tx, heartbeat_message(t, *last_seq))
+                {
                     break PumpOutcome::Closed {
                         code: None,
                         reason: reason.into(),
                         by_remote: false,
                     };
                 }
+                // The ack gap is recorded at send time so a silent guild can be measured against
+                // the watchdog budget instead of guessed at.
+                tracing::trace!(
+                    seq_ack = *last_seq,
+                    period_ms = hb.period().as_millis(),
+                    since_ack_ms = last_ack.elapsed().as_millis(),
+                    missed_acks_before_dead = MISSED_ACKS_BEFORE_DEAD,
+                    "voice: heartbeat sent (op 3)"
+                );
                 last_heartbeat = Some(Instant::now());
             },
             inbound = stream.next() => match inbound {
@@ -469,9 +480,16 @@ fn handle_inbound(
                 }
                 // Op 6 `HEARTBEAT_ACK`: record the round-trip since the last heartbeat as the ping.
                 6 => {
+                    let since_previous_ack = last_ack.elapsed();
                     *last_ack = Instant::now();
                     if let Some(sent) = last_heartbeat {
-                        ping.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let round_trip = sent.elapsed();
+                        ping.store(round_trip.as_millis() as u64, Ordering::Relaxed);
+                        tracing::trace!(
+                            round_trip_ms = round_trip.as_millis(),
+                            since_previous_ack_ms = since_previous_ack.as_millis(),
+                            "voice: heartbeat ack received (op 6)"
+                        );
                     }
                 }
                 // Op 8 `HELLO`: the announced cadence can change on a repeated HELLO, so rebuild
