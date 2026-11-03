@@ -65,11 +65,15 @@ pub(super) fn handle_dave_event(
             tracing::debug!(protocol_version, epoch, "DAVE prepare epoch");
             // Epoch 1 means a fresh MLS group, so reinit first: otherwise davey rejects its
             // proposals with `Wrong Epoch` / `AlreadyInGroup` and every frame fails to encrypt.
+            // The epoch's own version decides the session, not the version from the last op 4.
             if epoch == 1 {
-                if let Err(error) = dave.reinit() {
-                    tracing::warn!(%error, "DAVE: failed to reinit session for new epoch");
+                match dave.reinit_with_version(protocol_version) {
+                    Ok(()) if protocol_version > 0 => send_key_package(dave, ws_tx),
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "DAVE: failed to reinit session for new epoch")
+                    }
                 }
-                send_key_package(dave, ws_tx);
             }
         }
     }
@@ -266,5 +270,45 @@ mod tests {
         let mut expected = expected_user_ids(&roster, dave.session().user_id());
         expected.sort_unstable();
         assert_eq!(expected, vec![2, 7], "roster plus self");
+    }
+
+    // Op 24 carries its own protocol version; the epoch must be rebuilt at that version, not at
+    // whatever the last SESSION_DESCRIPTION left behind. A v0 epoch also sends no key package.
+    #[test]
+    fn a_prepare_epoch_uses_the_announced_version() {
+        let mut dave = DaveEncryptor::new(7, 9).expect("create session");
+        let mut pending = HashMap::new();
+        let mut roster = HashSet::new();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
+
+        handle_dave_event(
+            &mut dave,
+            &mut pending,
+            &mut roster,
+            DaveEvent::PrepareEpoch {
+                protocol_version: 0,
+                epoch: 1,
+            },
+            &ws_tx,
+        );
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "a v0 epoch must not send a key package"
+        );
+
+        handle_dave_event(
+            &mut dave,
+            &mut pending,
+            &mut roster,
+            DaveEvent::PrepareEpoch {
+                protocol_version: 1,
+                epoch: 1,
+            },
+            &ws_tx,
+        );
+        assert!(
+            ws_rx.try_recv().is_ok(),
+            "a v1 epoch must send a key package"
+        );
     }
 }
