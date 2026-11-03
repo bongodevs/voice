@@ -407,6 +407,7 @@ impl VoiceConnection {
             dave,
             transport,
             ssrc,
+            dave_version > 0,
             ws_tx.clone(),
             dave_rx,
             dispatcher.clone(),

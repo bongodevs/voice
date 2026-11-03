@@ -10,6 +10,7 @@ pub(super) async fn send_loop<P>(
     dave: DaveEncryptor,
     transport: Box<dyn crate::transport::TransportCipher>,
     ssrc: u32,
+    dave_enabled: bool,
     ws_tx: mpsc::UnboundedSender<Message>,
     mut dave_rx: mpsc::UnboundedReceiver<DaveEvent>,
     dispatcher: EventDispatcher,
@@ -20,6 +21,7 @@ pub(super) async fn send_loop<P>(
 {
     let speaking_tx = ws_tx.clone();
     let mut pacer = FramePacer::with_transport(provider, udp, dave, transport, ssrc);
+    pacer.set_dave_enabled(dave_enabled);
     pacer.on_speaking(move |speaking| {
         // Keep the shared flag in sync so the gateway task can re-announce it on op 11/12.
         speaking_flag.store(speaking, Ordering::Relaxed);
