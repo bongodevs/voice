@@ -61,8 +61,8 @@ pub(super) async fn gateway_loop(
 
     loop {
         let outcome = pump(
-            &mut sink,
-            &mut stream,
+            sink,
+            stream,
             &mut ws_rx,
             &dave_tx,
             &dispatcher,
@@ -98,7 +98,7 @@ pub(super) async fn gateway_loop(
                     tracing::debug!(code = code.unwrap_or(0), "voice: gateway closed locally");
                     break;
                 }
-                let mut recovered = false;
+                let mut recovered = None;
                 if is_resumable(code) && budget.can_attempt() {
                     // Only resume if still Connected; a concurrent `disconnect` sets Closed, and
                     // resuming would revive a connection the caller asked to drop.
@@ -111,8 +111,8 @@ pub(super) async fn gateway_loop(
                         )
                         .is_ok();
                     if !claimed {
-                        // `disconnect` raced in after the drop; flush its queued close and stop.
-                        let _ = sink.send(Message::Close(None)).await;
+                        // `disconnect` raced in after the drop; the writer has already flushed its
+                        // close.
                         return;
                     }
                     tracing::warn!(
@@ -125,21 +125,27 @@ pub(super) async fn gateway_loop(
                     // connection on the host at once, and a fixed schedule reconnects them in step.
                     while budget.can_attempt() {
                         // Nothing pumps `ws_rx` during this loop, so a `disconnect` queued there is
-                        // invisible; watch the state and flush the close frame ourselves instead of
-                        // leaking the session until Discord times it out.
+                        // invisible; watch the state instead of leaking the session until Discord
+                        // times it out.
                         if ConnectionState::from_u8(state.load(Ordering::SeqCst))
                             == ConnectionState::Closed
                         {
-                            let _ = sink.send(Message::Close(None)).await;
                             return;
                         }
                         sleep(backoff_delay(budget.attempts())).await;
                         budget.record_attempt();
-                        if let Ok((new_sink, new_stream)) = reconnect(&resume.url).await {
-                            sink = new_sink;
-                            stream = new_stream;
-                            if sink.send(resume_message(&resume, last_seq)).await.is_ok() {
-                                recovered = true;
+                        if let Ok((mut new_sink, new_stream)) = reconnect(&resume.url).await {
+                            // The resume has to finish before the new writer starts; a stalled
+                            // handshake must not pin the supervisor forever.
+                            let resumed = timeout(
+                                WRITE_TIMEOUT,
+                                new_sink.send(resume_message(&resume, last_seq)),
+                            )
+                            .await
+                            .map(|result| result.is_ok())
+                            .unwrap_or(false);
+                            if resumed {
+                                recovered = Some((new_sink, new_stream));
                                 break;
                             }
                         }
@@ -150,19 +156,24 @@ pub(super) async fn gateway_loop(
                         "voice: reconnect budget exhausted, reporting the close to the client"
                     );
                 }
-                if recovered {
-                    tracing::info!("voice: gateway session resumed");
-                    state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
-                } else {
-                    tracing::warn!(
-                        code = code.unwrap_or(1006),
-                        reason = %reason,
-                        by_remote,
-                        "voice: gateway closed"
-                    );
-                    state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
-                    dispatcher.dispatch(closed_event(code, reason, by_remote));
-                    break;
+                match recovered {
+                    Some((new_sink, new_stream)) => {
+                        sink = new_sink;
+                        stream = new_stream;
+                        tracing::info!("voice: gateway session resumed");
+                        state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
+                    }
+                    None => {
+                        tracing::warn!(
+                            code = code.unwrap_or(1006),
+                            reason = %reason,
+                            by_remote,
+                            "voice: gateway closed"
+                        );
+                        state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
+                        dispatcher.dispatch(closed_event(code, reason, by_remote));
+                        break;
+                    }
                 }
             }
         }
@@ -210,6 +221,7 @@ pub(super) fn backoff_delay(attempt: u32) -> Duration {
 }
 
 /// Outcome of one [`pump`] over a single WebSocket lifetime.
+#[derive(Debug)]
 enum PumpOutcome {
     /// The outbound channel closed (the connection was disconnected or dropped), so stop entirely.
     Stop,
@@ -224,11 +236,48 @@ enum PumpOutcome {
     },
 }
 
+/// Queue one message for the writer task without waiting. A full queue means the gateway has
+/// stopped reading, so the caller closes the session instead of buffering without bound.
+fn queue_outbound(tx: &mpsc::Sender<Message>, message: Message) -> Result<(), &'static str> {
+    match tx.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err("outbound queue full"),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err("outbound writer stopped"),
+    }
+}
+
+/// The only task that awaits a socket write. Keeping writes here means a stalled gateway cannot
+/// delay heartbeats or inbound reads, and every write has a deadline of its own.
+async fn writer_task<S>(
+    mut sink: S,
+    mut rx: mpsc::Receiver<Message>,
+    failed: mpsc::UnboundedSender<String>,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    while let Some(message) = rx.recv().await {
+        match timeout(WRITE_TIMEOUT, sink.send(message)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = failed.send(format!("outbound send failed: {error}"));
+                return;
+            }
+            Err(_) => {
+                let _ = failed.send("outbound send timed out".into());
+                return;
+            }
+        }
+    }
+    // The supervisor is stopping; give the close frame the same short grace as `disconnect`.
+    let _ = timeout(CLOSE_FLUSH_GRACE, sink.send(Message::Close(None))).await;
+}
+
 /// Drive one WebSocket until it drops or the outbound channel closes.
 #[allow(clippy::too_many_arguments)]
-async fn pump(
-    sink: &mut WsSink,
-    stream: &mut WsSource,
+async fn pump<S, R, E>(
+    sink: S,
+    mut stream: R,
     ws_rx: &mut mpsc::UnboundedReceiver<Message>,
     dave_tx: &mpsc::UnboundedSender<DaveEvent>,
     dispatcher: &EventDispatcher,
@@ -238,28 +287,42 @@ async fn pump(
     ping: &Arc<AtomicU64>,
     state: &Arc<AtomicU8>,
     session_confirmed: &mut bool,
-) -> PumpOutcome {
+) -> PumpOutcome
+where
+    S: futures_util::Sink<Message> + Unpin + Send + 'static,
+    S::Error: std::fmt::Display,
+    R: futures_util::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+    E: std::fmt::Display,
+{
+    let (write_tx, write_rx) = mpsc::channel::<Message>(WRITE_QUEUE_LEN);
+    let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<String>();
+    let mut writer = tokio::spawn(writer_task(sink, write_rx, failed_tx));
+
     // When the last heartbeat was sent, used to compute the round-trip on the matching ACK (op 6).
     let mut last_heartbeat: Option<Instant> = None;
     // A gateway that stops acking is dead even though its TCP connection still reads fine, so this
     // watchdog is what stops a zombie session swallowing every frame forever.
     let mut last_ack = Instant::now();
-    loop {
+    let outcome = loop {
         tokio::select! {
             outbound = ws_rx.recv() => match outbound {
                 Some(message) => {
-                    if sink.send(message).await.is_err() {
-                        return PumpOutcome::Closed {
+                    if let Err(reason) = queue_outbound(&write_tx, message) {
+                        break PumpOutcome::Closed {
                             code: None,
-                            reason: "outbound send failed".into(),
+                            reason: reason.into(),
                             by_remote: false,
                         };
                     }
                 }
-                None => {
-                    let _ = sink.send(Message::Close(None)).await;
-                    return PumpOutcome::Stop;
-                }
+                None => break PumpOutcome::Stop,
+            },
+            failure = failed_rx.recv() => {
+                break PumpOutcome::Closed {
+                    code: None,
+                    reason: failure.unwrap_or_else(|| "outbound writer stopped".into()),
+                    by_remote: false,
+                };
             },
             _ = hb.tick() => {
                 // A HELLO can change the period, so read it on every tick instead of caching it.
@@ -270,7 +333,7 @@ async fn pump(
                         "voice: no heartbeat ack, treating the gateway as dead"
                     );
                     // `code: None` is resumable, so the supervisor reconnects and sends op 7.
-                    return PumpOutcome::Closed {
+                    break PumpOutcome::Closed {
                         code: None,
                         reason: "heartbeat ack timeout".into(),
                         by_remote: false,
@@ -280,21 +343,17 @@ async fn pump(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|since| since.as_millis() as u64)
                     .unwrap_or(0);
-                if sink
-                    .send(heartbeat_message(t, *last_seq))
-                    .await
-                    .is_err()
-                {
-                    return PumpOutcome::Closed {
+                if let Err(reason) = queue_outbound(&write_tx, heartbeat_message(t, *last_seq)) {
+                    break PumpOutcome::Closed {
                         code: None,
-                        reason: "heartbeat send failed".into(),
+                        reason: reason.into(),
                         by_remote: false,
                     };
                 }
                 last_heartbeat = Some(Instant::now());
             },
             inbound = stream.next() => match inbound {
-                Some(Ok(Message::Close(frame))) => return close_outcome(frame),
+                Some(Ok(Message::Close(frame))) => break close_outcome(frame),
                 Some(Ok(message)) => handle_inbound(
                     message,
                     dave_tx,
@@ -312,14 +371,14 @@ async fn pump(
                     dispatcher.dispatch(VoiceEvent::GatewayError {
                         message: error.to_string(),
                     });
-                    return PumpOutcome::Closed {
+                    break PumpOutcome::Closed {
                         code: None,
                         reason: "connection error".into(),
                         by_remote: false,
                     };
                 }
                 None => {
-                    return PumpOutcome::Closed {
+                    break PumpOutcome::Closed {
                         code: None,
                         reason: String::new(),
                         by_remote: false,
@@ -327,7 +386,15 @@ async fn pump(
                 }
             },
         }
+    };
+
+    // Let the writer drain what is already queued, then stop it rather than block on a stuck
+    // socket. Closing the channel makes it emit the close frame first.
+    drop(write_tx);
+    if timeout(CLOSE_FLUSH_GRACE, &mut writer).await.is_err() {
+        writer.abort();
     }
+    outcome
 }
 
 /// Translate a WebSocket close frame into a [`PumpOutcome`].
@@ -555,6 +622,67 @@ pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectEr
 mod tests {
     use super::*;
     use futures_util::FutureExt;
+    use futures_util::StreamExt;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// A sink whose writes block after `free` frames, so a test can hold the writer mid-write.
+    struct GatedSink {
+        sent: mpsc::UnboundedSender<Message>,
+        free: usize,
+        written: usize,
+        stall: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl GatedSink {
+        fn new(free: usize) -> (Self, mpsc::UnboundedReceiver<Message>) {
+            let (sent, rx) = mpsc::unbounded_channel();
+            (
+                Self {
+                    sent,
+                    free,
+                    written: 0,
+                    stall: Box::pin(sleep(Duration::from_secs(3_600))),
+                },
+                rx,
+            )
+        }
+    }
+
+    impl futures_util::Sink<Message> for GatedSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            if self.written >= self.free {
+                return self.stall.as_mut().poll(cx).map(|_| Ok(()));
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.written += 1;
+            self.sent
+                .send(item)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     // Three successful reconnects in a row must not exhaust the budget.
     #[test]
@@ -826,6 +954,144 @@ mod tests {
                 assert_eq!(reason, "outbound send failed");
             }
             other => panic!("expected a gateway close, got {other:?}"),
+        }
+    }
+
+    // A blocked socket write must not stop inbound ops from being handled: the writer is stuck on
+    // its first frame while op 9 lands and flips the state back to Connected.
+    #[tokio::test]
+    async fn a_blocked_write_does_not_stop_inbound_reads() {
+        let (sink, mut written) = GatedSink::new(0);
+        let stream = futures_util::stream::once(async {
+            sleep(Duration::from_millis(5)).await;
+            Ok::<_, std::io::Error>(Message::text(json!({"op": 9, "d": {}}).to_string()))
+        })
+        .chain(futures_util::stream::pending::<
+            Result<Message, std::io::Error>,
+        >())
+        .boxed();
+
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
+        ws_tx.send(Message::text("outbound")).unwrap();
+
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Reconnecting as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+
+        let task = tokio::spawn({
+            let state = state.clone();
+            let ping = ping.clone();
+            async move {
+                let mut last_seq = 0;
+                let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+                let mut confirmed = false;
+                pump(
+                    sink,
+                    stream,
+                    &mut ws_rx,
+                    &dave_tx,
+                    &dispatcher,
+                    &reannounce,
+                    &mut hb,
+                    &mut last_seq,
+                    &ping,
+                    &state,
+                    &mut confirmed,
+                )
+                .await
+            }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.load(Ordering::SeqCst),
+            ConnectionState::Connected as u8,
+            "inbound op 9 must be handled while the writer is blocked"
+        );
+        assert!(
+            written.try_recv().is_err(),
+            "the gated sink must not have accepted a write"
+        );
+
+        drop(ws_tx);
+        let outcome = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("pump stops after the outbound channel closes")
+            .expect("pump task");
+        assert!(matches!(outcome, PumpOutcome::Stop));
+    }
+
+    // A write that never completes must fail at the write deadline instead of pinning the writer.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_write_times_out() {
+        let (sink, _written) = GatedSink::new(0);
+        let (write_tx, write_rx) = mpsc::channel(1);
+        let (failed_tx, mut failed_rx) = mpsc::unbounded_channel();
+        write_tx.send(Message::text("stuck")).await.unwrap();
+        let task = tokio::spawn(writer_task(sink, write_rx, failed_tx));
+
+        tokio::time::advance(WRITE_TIMEOUT + Duration::from_millis(1)).await;
+        let reason = failed_rx.recv().await.expect("a failure is reported");
+        assert_eq!(reason, "outbound send timed out");
+        task.await.unwrap();
+    }
+
+    // If the gateway stops reading, the bounded queue fills and the session closes rather than
+    // buffering every frame while the writer is stuck.
+    #[tokio::test]
+    async fn a_full_write_queue_closes_without_waiting() {
+        let (sink, _written) = GatedSink::new(0);
+        let stream = futures_util::stream::pending::<Result<Message, std::io::Error>>();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
+        for _ in 0..WRITE_QUEUE_LEN + 2 {
+            ws_tx.send(Message::text("frame")).unwrap();
+        }
+
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq = 0u64;
+        let mut confirmed = false;
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            pump(
+                sink,
+                stream,
+                &mut ws_rx,
+                &dave_tx,
+                &dispatcher,
+                &reannounce,
+                &mut hb,
+                &mut last_seq,
+                &ping,
+                &state,
+                &mut confirmed,
+            ),
+        )
+        .await
+        .expect("a full queue must close without waiting for the stalled write");
+
+        match outcome {
+            PumpOutcome::Closed { reason, .. } => {
+                assert_eq!(reason, "outbound queue full");
+            }
+            other => panic!("expected a closed gateway, got {other:?}"),
         }
     }
 }

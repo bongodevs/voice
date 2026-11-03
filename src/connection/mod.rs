@@ -59,6 +59,13 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// close frame, so it actually reaches Discord before the task is aborted.
 const CLOSE_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
+/// How long one gateway write may take before the socket is treated as dead.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Outbound gateway messages queued for the writer task. A full queue means the gateway stopped
+/// reading, so the session is closed instead of buffering without bound.
+const WRITE_QUEUE_LEN: usize = 1024;
+
 /// Lifecycle state of a [`VoiceConnection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
