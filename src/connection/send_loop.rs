@@ -1,6 +1,21 @@
 use super::builders::speaking_message;
 use super::dave::handle_dave_event;
 use super::*;
+use crate::frame::FRAME_DURATION;
+
+// A stage that takes longer than one slot is what makes the frame clock report a stall, so the two
+// stages that run on this task say which one did it. Payload bytes are never logged.
+fn dave_event_label(event: &DaveEvent) -> &'static str {
+    match event {
+        DaveEvent::Binary { .. } => "mls",
+        DaveEvent::PrepareTransition { .. } => "prepare-transition",
+        DaveEvent::ExecuteTransition { .. } => "execute-transition",
+        DaveEvent::PrepareEpoch { .. } => "prepare-epoch",
+        DaveEvent::UsersConnected { .. } => "users-connected",
+        DaveEvent::UserDisconnected { .. } => "user-disconnected",
+        DaveEvent::SessionDescription { .. } => "session-description",
+    }
+}
 
 /// The 20 ms send task, pacing frames through the [`FramePacer`] and applying DAVE MLS messages.
 #[allow(clippy::too_many_arguments)]
@@ -51,8 +66,19 @@ pub(super) async fn send_loop<P>(
             break;
         }
         tokio::select! {
-            _ = clock.wait() => {
-                match pacer.tick().await {
+            missed = clock.wait() => {
+                let started = Instant::now();
+                let outcome = pacer.tick().await;
+                let tick = started.elapsed();
+                if tick > FRAME_DURATION {
+                    tracing::warn!(
+                        tick_micros = tick.as_micros() as u64,
+                        missed,
+                        dropped = clock.dropped_frames(),
+                        "voice: send tick overran its frame slot"
+                    );
+                }
+                match outcome {
                     Ok(_) => consecutive_send_errors = 0,
                     Err(error) => {
                         consecutive_send_errors += 1;
@@ -82,6 +108,8 @@ pub(super) async fn send_loop<P>(
             event = dave_rx.recv(), if dave_open => {
                 match event {
                     Some(event) => {
+                        let label = dave_event_label(&event);
+                        let started = Instant::now();
                         // A repeated SESSION_DESCRIPTION rotates the transport key and mode. Build
                         // the new cipher before the next frame; the old key would make Discord
                         // drop every packet it cannot decrypt.
@@ -119,6 +147,15 @@ pub(super) async fn send_loop<P>(
                             event,
                             &ws_tx,
                         );
+                        let took = started.elapsed();
+                        if took > FRAME_DURATION {
+                            tracing::warn!(
+                                event = label,
+                                dave_micros = took.as_micros() as u64,
+                                dropped = clock.dropped_frames(),
+                                "voice: DAVE handling overran a frame slot"
+                            );
+                        }
                         // The group flipping to active means end-to-end encryption is on, so
                         // announce it once with the privacy code.
                         let ready = pacer.dave_mut().is_ready();

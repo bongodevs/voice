@@ -55,12 +55,20 @@ impl FrameClock {
         // simply runs now.
         let missed = ((now - self.next).as_nanos() / FRAME_DURATION.as_nanos()) as u64;
         self.next = if missed > MAX_CATCHUP_FRAMES {
-            tracing::warn!(missed, "voice: frame clock stalled, resynchronising");
             now + FRAME_DURATION
         } else {
             self.next + FRAME_DURATION
         };
         self.dropped = self.dropped.saturating_add(missed);
+        if missed > MAX_CATCHUP_FRAMES {
+            // The cumulative count separates a one-off hitch from a connection that is losing
+            // seconds of audio and needs the slow-stage logs to say which stage.
+            tracing::warn!(
+                missed,
+                dropped = self.dropped,
+                "voice: frame clock stalled, resynchronising"
+            );
+        }
         missed
     }
 
