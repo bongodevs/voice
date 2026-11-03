@@ -20,6 +20,13 @@ pub(super) fn select_protocol_message(discovered: &DiscoveredAddress, mode: &str
         "op": 1,
         "d": {
             "protocol": "udp",
+            "codecs": [{
+                "name": "opus",
+                "type": "audio",
+                "priority": 1000,
+                "payload_type": 120,
+            }],
+            "rtc_connection_id": uuid::Uuid::new_v4().to_string(),
             "data": { "address": discovered.ip, "port": discovered.port, "mode": mode }
         }
     })
@@ -79,4 +86,49 @@ pub(super) fn close_message() -> Message {
         code: CloseCode::Normal,
         reason: Default::default(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::udp::DiscoveredAddress;
+
+    // The reference announces its codec list and a fresh RTC connection id on SELECT_PROTOCOL.
+    // Omitting them is accepted by some SFUs but leaves the negotiation incomplete.
+    #[test]
+    fn select_protocol_announces_opus_and_a_connection_id() {
+        let discovered = DiscoveredAddress {
+            ip: "203.0.113.7".into(),
+            port: 50_000,
+        };
+        let first: Value = serde_json::from_str(&select_protocol_message(
+            &discovered,
+            "aead_aes256_gcm_rtpsize",
+        ))
+        .unwrap();
+        let second: Value = serde_json::from_str(&select_protocol_message(
+            &discovered,
+            "aead_aes256_gcm_rtpsize",
+        ))
+        .unwrap();
+
+        let codec = &first["d"]["codecs"][0];
+        assert_eq!(codec["name"], "opus");
+        assert_eq!(codec["type"], "audio");
+        assert_eq!(codec["priority"], 1000);
+        assert_eq!(codec["payload_type"], 120);
+        assert_eq!(first["d"]["protocol"], "udp");
+        assert_eq!(first["d"]["data"]["address"], "203.0.113.7");
+        assert_eq!(first["d"]["data"]["mode"], "aead_aes256_gcm_rtpsize");
+
+        let id = first["d"]["rtc_connection_id"]
+            .as_str()
+            .expect("a connection id is sent");
+        assert_eq!(id.len(), 36, "a UUID is expected");
+        assert_ne!(
+            id,
+            second["d"]["rtc_connection_id"].as_str().unwrap(),
+            "each SELECT_PROTOCOL gets a fresh connection id"
+        );
+    }
 }
