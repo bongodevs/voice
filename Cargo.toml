@@ -1,6 +1,6 @@
 [package]
 name = "voice"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "Discord voice sending with Gateway v8, UDP/RTP, and DAVE (MLS) end-to-end encryption"
 license = "MIT"
