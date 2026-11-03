@@ -28,9 +28,9 @@ pub(super) fn select_protocol_message(discovered: &DiscoveredAddress, mode: &str
     .to_string()
 }
 
-pub(super) fn heartbeat_message(nonce: u64, seq_ack: u64) -> Message {
-    // Voice gateway v8: heartbeat carries a nonce and the last acknowledged sequence number.
-    Message::text(json!({ "op": 3, "d": { "t": nonce, "seq_ack": seq_ack } }).to_string())
+pub(super) fn heartbeat_message(t: u64, seq_ack: u64) -> Message {
+    // Voice gateway v8: `t` is epoch milliseconds and `seq_ack` the latest received sequence.
+    Message::text(json!({ "op": 3, "d": { "t": t, "seq_ack": seq_ack } }).to_string())
 }
 
 pub(super) fn resume_message(resume: &ResumeInfo, seq_ack: u64) -> Message {

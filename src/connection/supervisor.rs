@@ -47,7 +47,6 @@ pub(super) async fn gateway_loop(
 ) {
     let mut hb = interval(Duration::from_millis(heartbeat_interval_ms.max(1.0) as u64));
     hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut nonce: u64 = 0;
     let mut budget = ReconnectBudget::new();
     // The handshake's session description starts the budget at zero; this covers op 4/op 9 mid-loop.
     let mut session_confirmed = false;
@@ -61,7 +60,6 @@ pub(super) async fn gateway_loop(
             &dispatcher,
             &reannounce,
             &mut hb,
-            &mut nonce,
             &mut last_seq,
             &ping,
             &state,
@@ -228,7 +226,6 @@ async fn pump(
     dispatcher: &EventDispatcher,
     reannounce: &SpeakingReannounce,
     hb: &mut tokio::time::Interval,
-    nonce: &mut u64,
     last_seq: &mut u64,
     ping: &Arc<AtomicU64>,
     state: &Arc<AtomicU8>,
@@ -270,9 +267,12 @@ async fn pump(
                         by_remote: false,
                     };
                 }
-                *nonce = nonce.wrapping_add(1);
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_millis() as u64)
+                    .unwrap_or(0);
                 if sink
-                    .send(heartbeat_message(*nonce, *last_seq))
+                    .send(heartbeat_message(t, *last_seq))
                     .await
                     .is_err()
                 {
@@ -354,7 +354,9 @@ fn handle_inbound(
         // Binary header: seq (2, BE) + op (1) + MLS payload.
         Message::Binary(bytes) => {
             if bytes.len() >= 2 {
-                *last_seq = (*last_seq).max(u16::from_be_bytes([bytes[0], bytes[1]]) as u64);
+                // The wire sequence is 16-bit and wraps, so the latest value must win even when it
+                // is numerically smaller than the previous one.
+                *last_seq = u16::from_be_bytes([bytes[0], bytes[1]]) as u64;
             }
             forward_dave_binary(&bytes, dave_tx);
         }
@@ -362,8 +364,8 @@ fn handle_inbound(
             let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
                 return;
             };
-            if let Some(s) = value["seq"].as_u64() {
-                *last_seq = (*last_seq).max(s);
+            if let Some(seq) = value["seq"].as_u64() {
+                *last_seq = seq;
             }
             let d = &value["d"];
             let Some(op) = value["op"].as_u64() else {
@@ -652,6 +654,65 @@ mod tests {
             }
             other => panic!("expected a session-description event, got {other:?}"),
         }
+    }
+
+    // The inbound sequence is 16-bit and wraps; acking the maximum would pin seq_ack at 65535.
+    #[test]
+    fn sequence_tracks_the_latest_value_across_a_wrap() {
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq: u64 = 0;
+        let mut last_ack = Instant::now();
+        let mut confirmed = false;
+
+        for seq in [65_535u16, 1] {
+            handle_inbound(
+                Message::Binary(bytes::Bytes::from(vec![(seq >> 8) as u8, seq as u8, 0])),
+                &dave_tx,
+                &dispatcher,
+                &reannounce,
+                &state,
+                &mut last_seq,
+                &ping,
+                None,
+                &mut last_ack,
+                &mut confirmed,
+            );
+        }
+        assert_eq!(last_seq, 1, "the latest sequence must win after a wrap");
+
+        let value: serde_json::Value = serde_json::from_str(
+            heartbeat_message(1_700_000_000_000, last_seq)
+                .into_text()
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(value["d"]["seq_ack"], 1);
+        assert_eq!(value["d"]["t"], 1_700_000_000_000u64);
+
+        let resume = ResumeInfo {
+            url: "wss://x/?v=8".into(),
+            server_id: 9,
+            session_id: "sid".into(),
+            token: "tok".into(),
+        };
+        let value: serde_json::Value = serde_json::from_str(
+            resume_message(&resume, last_seq)
+                .into_text()
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(value["d"]["seq_ack"], 1);
     }
 
     #[test]
