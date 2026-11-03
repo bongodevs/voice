@@ -464,6 +464,8 @@ fn handle_inbound(
                             "voice: session description without a usable mode or key"
                         ),
                     }
+                    // The reference refreshes the speaking/SSRC mapping on every description.
+                    reannounce.announce_if_speaking();
                 }
                 // Op 6 `HEARTBEAT_ACK`: record the round-trip since the last heartbeat as the ping.
                 6 => {
@@ -497,8 +499,6 @@ fn handle_inbound(
                             });
                         }
                     }
-                    // A client joined: re-announce speaking so it maps our SSRC and hears us.
-                    reannounce.announce_if_speaking();
                 }
                 // Op 12 `VIDEO`: a single user's stream SSRCs changed (carries `user_id` +
                 // `audio_ssrc`).
@@ -509,7 +509,7 @@ fn handle_inbound(
                             audio_ssrc: d["audio_ssrc"].as_u64().unwrap_or(0) as u32,
                         });
                     }
-                    // A client joined: re-announce speaking so it maps our SSRC and hears us.
+                    // A user's stream changed: refresh our SSRC mapping, as the reference does.
                     reannounce.announce_if_speaking();
                 }
                 // Op 13 `CLIENT_DISCONNECT`.
@@ -1093,5 +1093,61 @@ mod tests {
             }
             other => panic!("expected a closed gateway, got {other:?}"),
         }
+    }
+
+    // The reference re-announces speaking on a user's stream change (op 12) and on a session
+    // description, but not on CLIENT_CONNECT (op 11).
+    #[tokio::test]
+    async fn speaking_is_reannounced_on_stream_changes_and_descriptions() {
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, mut speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(true)),
+            ssrc: 77,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq = 0u64;
+        let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+        let mut confirmed = false;
+
+        let mut inbound = |payload: Value| {
+            handle_inbound(
+                Message::text(payload.to_string()),
+                &dave_tx,
+                &dispatcher,
+                &reannounce,
+                &state,
+                &mut last_seq,
+                &ping,
+                None,
+                &mut last_ack,
+                &mut hb,
+                &mut confirmed,
+            );
+        };
+
+        inbound(json!({"op": 11, "d": {"user_ids": ["1"]}}));
+        assert!(
+            speak_rx.try_recv().is_err(),
+            "op 11 must not re-announce speaking"
+        );
+
+        inbound(json!({"op": 12, "d": {"user_id": "1", "audio_ssrc": 5}}));
+        let message = speak_rx.try_recv().expect("op 12 re-announces speaking");
+        let value: Value = serde_json::from_str(message.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(value["op"], 5);
+        assert_eq!(value["d"]["speaking"], 1);
+        assert_eq!(value["d"]["ssrc"], 77);
+
+        inbound(json!({"op": 4, "d": {}}));
+        let message = speak_rx
+            .try_recv()
+            .expect("a session description re-announces speaking");
+        let value: Value = serde_json::from_str(message.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(value["op"], 5);
     }
 }

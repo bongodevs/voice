@@ -164,8 +164,8 @@ impl VoiceServerInfo {
     }
 }
 
-/// Re-announces our speaking state on op 11/12 so clients that join after playback began get our
-/// SSRC-to-user mapping; without it late joiners hear nothing.
+/// Re-announces our speaking state on a user's stream change (op 12) and on a session description,
+/// so clients that join after playback began still map our SSRC to the bot user.
 #[derive(Clone)]
 struct SpeakingReannounce {
     ws_tx: mpsc::UnboundedSender<Message>,
