@@ -73,12 +73,6 @@ impl DaveEncryptor {
         self.session.reinit(version, user_id, channel_id, None)
     }
 
-    /// Enable or disable passthrough mode (used during DAVE transitions / downgrades). When
-    /// disabling, davey applies the default ~10 s transition grace period.
-    pub fn set_passthrough(&mut self, enabled: bool) {
-        self.session.set_passthrough_mode(enabled, None);
-    }
-
     /// Tear down the MLS group and clear key material, for a downgrade to DAVE v0.
     /// Afterwards the session is INACTIVE and frames pass through unencrypted.
     pub fn reset(&mut self) {

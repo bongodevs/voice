@@ -46,10 +46,6 @@ pub(super) fn handle_dave_event(
             transition_id,
         } => {
             pending.insert(transition_id, protocol_version);
-            // A downgrade to v0 (DAVE disabled): allow plaintext during the grace period.
-            if protocol_version == 0 {
-                dave.set_passthrough(true);
-            }
             // Transition 0 is the initial handshake and is not acknowledged.
             if transition_id != 0 {
                 let _ = ws_tx.send(transition_ready_message(transition_id));
@@ -57,13 +53,9 @@ pub(super) fn handle_dave_event(
         }
         DaveEvent::ExecuteTransition { transition_id } => {
             // A v0 downgrade tears the group down; an upgrade already installed the new epoch's
-            // ratchet in `process_commit`, so it only has to leave passthrough.
-            if let Some(protocol_version) = pending.remove(&transition_id) {
-                if protocol_version == 0 {
-                    dave.reset();
-                } else {
-                    dave.set_passthrough(false);
-                }
+            // ratchet in `process_commit`.
+            if pending.remove(&transition_id) == Some(0) {
+                dave.reset();
             }
         }
         DaveEvent::PrepareEpoch {
