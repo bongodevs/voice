@@ -126,6 +126,12 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         }
     }
 
+    /// Replace the transport cipher, e.g. after a repeated `SESSION_DESCRIPTION` rotates the key.
+    /// The RTP sequence and timestamp keep running; only the transport key/mode changes.
+    pub fn set_transport(&mut self, transport: Box<dyn TransportCipher>) {
+        self.transport = transport;
+    }
+
     /// Register a callback invoked when the speaking state changes (send a gateway `SPEAKING`
     /// op from here in a real connection).
     pub fn on_speaking(&mut self, handler: impl FnMut(bool) + Send + 'static) {
@@ -226,6 +232,35 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::VecSink;
+    use crate::transport::AesGcmRtpSize;
+
+    // A repeated SESSION_DESCRIPTION rotates the key; the next frame must use the new cipher.
+    #[tokio::test]
+    async fn a_replaced_transport_encrypts_the_next_frame() {
+        let sink = VecSink::new();
+        let mut frames = vec![
+            bytes::Bytes::from_static(b"frame"),
+            bytes::Bytes::from_static(b"frame"),
+        ];
+        let dave = DaveEncryptor::new(1, 2).expect("create session");
+        let mut pacer = FramePacer::new(move || frames.pop(), sink.clone(), dave, 0x1234);
+
+        assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Sent);
+        assert_eq!(
+            sink.packets().pop().expect("plaintext packet").len(),
+            RTP_HEADER_LEN + 5,
+            "the initial transport is plaintext"
+        );
+
+        pacer.set_transport(Box::new(AesGcmRtpSize::new(&[7u8; 32]).expect("cipher")));
+        assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Sent);
+        assert_eq!(
+            sink.packets().pop().expect("encrypted packet").len(),
+            RTP_HEADER_LEN + 5 + 16 + 4,
+            "tag and nonce suffix come from the replacement cipher"
+        );
+    }
 
     #[tokio::test]
     async fn frame_clock_catches_up_a_late_slot_then_resynchronises() {

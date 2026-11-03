@@ -80,6 +80,36 @@ pub(super) async fn send_loop<P>(
             event = dave_rx.recv(), if dave_open => {
                 match event {
                     Some(event) => {
+                        // A repeated SESSION_DESCRIPTION rotates the transport key and mode. Build
+                        // the new cipher before the next frame; the old key would make Discord
+                        // drop every packet it cannot decrypt.
+                        if let DaveEvent::SessionDescription {
+                            secret_key, mode, ..
+                        } = &event
+                        {
+                            match cipher_for_mode(mode, secret_key) {
+                                Ok(cipher) => {
+                                    pacer.set_transport(cipher);
+                                    tracing::info!(%mode, "voice: transport cipher replaced");
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "voice: session description has no usable cipher"
+                                    );
+                                    // Cannot encrypt for the server, so end this connection and let
+                                    // the higher layer rebuild the voice state.
+                                    state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
+                                    dispatcher.dispatch(VoiceEvent::GatewayClosed {
+                                        code: 4900,
+                                        reason: "unsupported transport mode".into(),
+                                        by_remote: false,
+                                    });
+                                    let _ = ws_tx.send(close_message());
+                                    break;
+                                }
+                            }
+                        }
                         handle_dave_event(
                             pacer.dave_mut(),
                             &mut pending,

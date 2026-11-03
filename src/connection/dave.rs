@@ -20,6 +20,27 @@ pub(super) fn handle_dave_event(
         DaveEvent::UserDisconnected { user_id } => {
             roster.remove(&user_id);
         }
+        // A repeated op 4 replaces the encryption session. Rebuilding the MLS session here is what
+        // the reference does; our key package has to go out for the new group.
+        DaveEvent::SessionDescription {
+            dave_protocol_version,
+            ..
+        } => match dave.reinit_with_version(dave_protocol_version) {
+            Ok(()) => {
+                tracing::info!(
+                    dave_protocol_version,
+                    "DAVE: new session description applied"
+                );
+                if dave_protocol_version > 0 {
+                    send_key_package(dave, ws_tx);
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                dave_protocol_version,
+                "DAVE: failed to apply a new session description"
+            ),
+        },
         DaveEvent::PrepareTransition {
             protocol_version,
             transition_id,

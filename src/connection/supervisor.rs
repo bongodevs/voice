@@ -371,9 +371,19 @@ fn handle_inbound(
             };
             forward_dave_json(op, d, dave_tx);
             match op {
-                // Op 4 `SESSION_DESCRIPTION`: a fresh session, so the reconnect budget is restored.
+                // Op 4 `SESSION_DESCRIPTION`: a fresh session, so the reconnect budget is
+                // restored. The transport key/mode can rotate on a repeated description, so the
+                // send task has to rebuild its cipher instead of keeping the handshake's key.
                 4 => {
                     *session_confirmed = true;
+                    match session_description_event(d) {
+                        Some(event) => {
+                            let _ = dave_tx.send(event);
+                        }
+                        None => tracing::warn!(
+                            "voice: session description without a usable mode or key"
+                        ),
+                    }
                 }
                 // Op 6 `HEARTBEAT_ACK`: record the round-trip since the last heartbeat as the ping.
                 6 => {
@@ -427,6 +437,25 @@ fn handle_inbound(
         }
         _ => {}
     }
+}
+
+/// Build the event that carries a repeated `SESSION_DESCRIPTION`'s transport and DAVE settings.
+/// `None` when the payload has no mode or no key, in which case the old cipher has to stay.
+fn session_description_event(d: &Value) -> Option<DaveEvent> {
+    let mode = d["mode"].as_str()?.to_string();
+    let secret_key: Vec<u8> = d["secret_key"]
+        .as_array()?
+        .iter()
+        .filter_map(|n| n.as_u64().map(|x| x as u8))
+        .collect();
+    if secret_key.is_empty() {
+        return None;
+    }
+    Some(DaveEvent::SessionDescription {
+        secret_key,
+        mode,
+        dave_protocol_version: d["dave_protocol_version"].as_u64().unwrap_or(0) as u16,
+    })
 }
 
 /// Forward a binary MLS op (`[seq: u16 BE][op: u8][mls…]`) to the send task, which owns the DAVE
@@ -567,6 +596,61 @@ mod tests {
             );
 
             assert!(confirmed, "op {op} must confirm the session");
+        }
+    }
+
+    // A repeated op 4 rotates the transport key/mode and the DAVE version. Without forwarding it,
+    // the send task keeps encrypting with the stale key and Discord drops every frame.
+    #[test]
+    fn a_repeated_session_description_forwards_the_new_cipher() {
+        let (dave_tx, mut dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq: u64 = 0;
+        let mut last_ack = Instant::now();
+        let mut confirmed = false;
+        let payload = json!({
+            "op": 4,
+            "d": {
+                "mode": "aead_aes256_gcm_rtpsize",
+                "secret_key": vec![7u8; 32],
+                "dave_protocol_version": 1,
+            }
+        })
+        .to_string();
+
+        handle_inbound(
+            Message::text(payload),
+            &dave_tx,
+            &dispatcher,
+            &reannounce,
+            &state,
+            &mut last_seq,
+            &ping,
+            None,
+            &mut last_ack,
+            &mut confirmed,
+        );
+
+        assert!(confirmed, "op 4 still confirms the session");
+        match dave_rx.try_recv() {
+            Ok(DaveEvent::SessionDescription {
+                secret_key,
+                mode,
+                dave_protocol_version,
+            }) => {
+                assert_eq!(secret_key, vec![7u8; 32]);
+                assert_eq!(mode, "aead_aes256_gcm_rtpsize");
+                assert_eq!(dave_protocol_version, 1);
+            }
+            other => panic!("expected a session-description event, got {other:?}"),
         }
     }
 

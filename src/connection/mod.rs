@@ -101,6 +101,7 @@ type WsSink = SplitSink<WsStream, Message>;
 type WsSource = SplitStream<WsStream>;
 
 /// A DAVE event forwarded from the gateway supervisor to the send task (which owns the session).
+#[derive(Debug)]
 enum DaveEvent {
     /// A binary MLS op (25/27/29/30) with its payload.
     Binary { op: u8, payload: Vec<u8> },
@@ -117,6 +118,15 @@ enum DaveEvent {
     UsersConnected { user_ids: Vec<u64> },
     /// Op 13 `CLIENT_DISCONNECT`: a user left.
     UserDisconnected { user_id: u64 },
+    /// Op 4 `SESSION_DESCRIPTION`: the transport key/mode and DAVE version to apply.
+    SessionDescription {
+        /// The 32-byte transport secret key.
+        secret_key: Vec<u8>,
+        /// The negotiated transport mode wire name (`d.mode`).
+        mode: String,
+        /// The negotiated DAVE protocol version (`0` disables DAVE).
+        dave_protocol_version: u16,
+    },
 }
 
 /// Everything needed to join a voice channel, sourced from the main gateway's `VOICE_STATE_UPDATE`
