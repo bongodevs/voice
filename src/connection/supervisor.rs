@@ -29,6 +29,15 @@ impl ReconnectBudget {
     }
 }
 
+/// A heartbeat interval whose first tick waits a full period, as the reference's
+/// `scheduleAtFixedRate` does. A zero period would panic, so keep at least one millisecond.
+fn heartbeat_interval(period: Duration) -> tokio::time::Interval {
+    let period = period.max(Duration::from_millis(1));
+    let mut interval = interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
+
 /// Gateway supervisor: owns the WebSocket, heartbeats, dispatches inbound ops, and resumes on a
 /// dropped connection while the send task (UDP/DAVE) keeps running.
 #[allow(clippy::too_many_arguments)]
@@ -45,8 +54,7 @@ pub(super) async fn gateway_loop(
     dispatcher: EventDispatcher,
     reannounce: SpeakingReannounce,
 ) {
-    let mut hb = interval(Duration::from_millis(heartbeat_interval_ms.max(1.0) as u64));
-    hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut hb = heartbeat_interval(Duration::from_millis(heartbeat_interval_ms as u64));
     let mut budget = ReconnectBudget::new();
     // The handshake's session description starts the budget at zero; this covers op 4/op 9 mid-loop.
     let mut session_confirmed = false;
@@ -236,7 +244,6 @@ async fn pump(
     // A gateway that stops acking is dead even though its TCP connection still reads fine, so this
     // watchdog is what stops a zombie session swallowing every frame forever.
     let mut last_ack = Instant::now();
-    let ack_timeout = hb.period() * MISSED_ACKS_BEFORE_DEAD;
     loop {
         tokio::select! {
             outbound = ws_rx.recv() => match outbound {
@@ -255,6 +262,8 @@ async fn pump(
                 }
             },
             _ = hb.tick() => {
+                // A HELLO can change the period, so read it on every tick instead of caching it.
+                let ack_timeout = hb.period() * MISSED_ACKS_BEFORE_DEAD;
                 if last_ack.elapsed() > ack_timeout {
                     tracing::warn!(
                         elapsed_ms = last_ack.elapsed().as_millis(),
@@ -296,6 +305,7 @@ async fn pump(
                     ping,
                     last_heartbeat,
                     &mut last_ack,
+                    hb,
                     session_confirmed,
                 ),
                 Some(Err(error)) => {
@@ -348,6 +358,7 @@ fn handle_inbound(
     ping: &Arc<AtomicU64>,
     last_heartbeat: Option<Instant>,
     last_ack: &mut Instant,
+    hb: &mut tokio::time::Interval,
     session_confirmed: &mut bool,
 ) {
     match message {
@@ -392,6 +403,14 @@ fn handle_inbound(
                     *last_ack = Instant::now();
                     if let Some(sent) = last_heartbeat {
                         ping.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    }
+                }
+                // Op 8 `HELLO`: the announced cadence can change on a repeated HELLO, so rebuild
+                // the interval and give the new period a fresh ACK window.
+                8 => {
+                    if let Some(interval) = d["heartbeat_interval"].as_u64() {
+                        *hb = heartbeat_interval(Duration::from_millis(interval));
+                        *last_ack = Instant::now();
                     }
                 }
                 // Op 9 `RESUMED`: mark the session connected again and restore the reconnect budget.
@@ -535,6 +554,7 @@ pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
 
     // Three successful reconnects in a row must not exhaust the budget.
     #[test]
@@ -566,8 +586,8 @@ mod tests {
     }
 
     // Op 4 and op 9 both confirm the session, which is what restores the budget.
-    #[test]
-    fn session_description_and_resumed_confirm_the_session() {
+    #[tokio::test]
+    async fn session_description_and_resumed_confirm_the_session() {
         for op in [4u64, 9] {
             let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
             let dispatcher = EventDispatcher::new();
@@ -581,6 +601,7 @@ mod tests {
             let ping = Arc::new(AtomicU64::new(0));
             let mut last_seq: u64 = 0;
             let mut last_ack = Instant::now();
+            let mut hb = heartbeat_interval(Duration::from_millis(41_250));
             let mut confirmed = false;
             let payload = format!(r#"{{"op":{op},"d":{{}}}}"#);
 
@@ -594,6 +615,7 @@ mod tests {
                 &ping,
                 None,
                 &mut last_ack,
+                &mut hb,
                 &mut confirmed,
             );
 
@@ -601,10 +623,59 @@ mod tests {
         }
     }
 
+    // HELLO can arrive mid-connection with a new interval; the reference rebuilds its fixed-rate
+    // schedule from that point. The first beat of either schedule waits a full period.
+    #[tokio::test]
+    async fn hello_rearms_the_heartbeat_interval() {
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq: u64 = 0;
+        let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+        let mut confirmed = false;
+
+        assert!(
+            hb.tick().now_or_never().is_none(),
+            "the first heartbeat must wait one full interval"
+        );
+
+        handle_inbound(
+            Message::text(json!({"op": 8, "d": {"heartbeat_interval": 30_000}}).to_string()),
+            &dave_tx,
+            &dispatcher,
+            &reannounce,
+            &state,
+            &mut last_seq,
+            &ping,
+            None,
+            &mut last_ack,
+            &mut hb,
+            &mut confirmed,
+        );
+
+        assert_eq!(
+            hb.period(),
+            Duration::from_millis(30_000),
+            "op 8 must replace the old heartbeat interval"
+        );
+        assert!(
+            hb.tick().now_or_never().is_none(),
+            "the re-armed heartbeat must also wait one full interval"
+        );
+    }
+
     // A repeated op 4 rotates the transport key/mode and the DAVE version. Without forwarding it,
     // the send task keeps encrypting with the stale key and Discord drops every frame.
-    #[test]
-    fn a_repeated_session_description_forwards_the_new_cipher() {
+    #[tokio::test]
+    async fn a_repeated_session_description_forwards_the_new_cipher() {
         let (dave_tx, mut dave_rx) = mpsc::unbounded_channel();
         let dispatcher = EventDispatcher::new();
         let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
@@ -617,6 +688,7 @@ mod tests {
         let ping = Arc::new(AtomicU64::new(0));
         let mut last_seq: u64 = 0;
         let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
         let mut confirmed = false;
         let payload = json!({
             "op": 4,
@@ -638,6 +710,7 @@ mod tests {
             &ping,
             None,
             &mut last_ack,
+            &mut hb,
             &mut confirmed,
         );
 
@@ -657,8 +730,8 @@ mod tests {
     }
 
     // The inbound sequence is 16-bit and wraps; acking the maximum would pin seq_ack at 65535.
-    #[test]
-    fn sequence_tracks_the_latest_value_across_a_wrap() {
+    #[tokio::test]
+    async fn sequence_tracks_the_latest_value_across_a_wrap() {
         let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
         let dispatcher = EventDispatcher::new();
         let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
@@ -671,6 +744,7 @@ mod tests {
         let ping = Arc::new(AtomicU64::new(0));
         let mut last_seq: u64 = 0;
         let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
         let mut confirmed = false;
 
         for seq in [65_535u16, 1] {
@@ -684,6 +758,7 @@ mod tests {
                 &ping,
                 None,
                 &mut last_ack,
+                &mut hb,
                 &mut confirmed,
             );
         }
