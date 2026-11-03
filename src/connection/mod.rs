@@ -652,6 +652,10 @@ mod tests {
         assert_eq!(value["d"]["server_id"], "99");
         assert_eq!(value["d"]["session_id"], "sid");
         assert_eq!(value["d"]["seq_ack"], 12);
+        assert!(
+            value["d"].get("video").is_none(),
+            "the v8 resume must not carry the v5 video field"
+        );
     }
 
     #[test]
@@ -795,6 +799,10 @@ mod tests {
         let value: Value =
             serde_json::from_str(identify_message(&info("region.discord.media")).as_str()).unwrap();
         assert_eq!(value["d"]["channel_id"].as_str(), Some("3"));
+        assert!(
+            value["d"].get("video").is_none(),
+            "the v8 identify must not carry the v5 video field"
+        );
     }
 
     #[test]

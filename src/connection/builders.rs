@@ -10,8 +10,6 @@ pub(super) fn identify_message(info: &VoiceServerInfo) -> String {
             "session_id": info.session_id,
             "token": info.token,
             "max_dave_protocol_version": crate::dave::davey::DAVE_PROTOCOL_VERSION,
-            // Discord forces video off for bots regardless of this flag.
-            "video": true,
         }
     })
     .to_string()
@@ -41,7 +39,6 @@ pub(super) fn resume_message(resume: &ResumeInfo, seq_ack: u64) -> Message {
                 "server_id": resume.server_id.to_string(),
                 "session_id": resume.session_id,
                 "token": resume.token,
-                "video": true,
                 "seq_ack": seq_ack,
             }
         })
