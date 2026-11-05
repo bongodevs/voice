@@ -10,8 +10,6 @@ pub(super) fn identify_message(info: &VoiceServerInfo) -> String {
             "session_id": info.session_id,
             "token": info.token,
             "max_dave_protocol_version": crate::dave::davey::DAVE_PROTOCOL_VERSION,
-            // Discord forces video off for bots regardless of this flag.
-            "video": true,
         }
     })
     .to_string()
@@ -22,15 +20,22 @@ pub(super) fn select_protocol_message(discovered: &DiscoveredAddress, mode: &str
         "op": 1,
         "d": {
             "protocol": "udp",
+            "codecs": [{
+                "name": "opus",
+                "type": "audio",
+                "priority": 1000,
+                "payload_type": 120,
+            }],
+            "rtc_connection_id": uuid::Uuid::new_v4().to_string(),
             "data": { "address": discovered.ip, "port": discovered.port, "mode": mode }
         }
     })
     .to_string()
 }
 
-pub(super) fn heartbeat_message(nonce: u64, seq_ack: u64) -> Message {
-    // Voice gateway v8: heartbeat carries a nonce and the last acknowledged sequence number.
-    Message::text(json!({ "op": 3, "d": { "t": nonce, "seq_ack": seq_ack } }).to_string())
+pub(super) fn heartbeat_message(t: u64, seq_ack: u64) -> Message {
+    // Voice gateway v8: `t` is epoch milliseconds and `seq_ack` the latest received sequence.
+    Message::text(json!({ "op": 3, "d": { "t": t, "seq_ack": seq_ack } }).to_string())
 }
 
 pub(super) fn resume_message(resume: &ResumeInfo, seq_ack: u64) -> Message {
@@ -41,7 +46,6 @@ pub(super) fn resume_message(resume: &ResumeInfo, seq_ack: u64) -> Message {
                 "server_id": resume.server_id.to_string(),
                 "session_id": resume.session_id,
                 "token": resume.token,
-                "video": true,
                 "seq_ack": seq_ack,
             }
         })
@@ -82,4 +86,49 @@ pub(super) fn close_message() -> Message {
         code: CloseCode::Normal,
         reason: Default::default(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::udp::DiscoveredAddress;
+
+    // The reference announces its codec list and a fresh RTC connection id on SELECT_PROTOCOL.
+    // Omitting them is accepted by some SFUs but leaves the negotiation incomplete.
+    #[test]
+    fn select_protocol_announces_opus_and_a_connection_id() {
+        let discovered = DiscoveredAddress {
+            ip: "203.0.113.7".into(),
+            port: 50_000,
+        };
+        let first: Value = serde_json::from_str(&select_protocol_message(
+            &discovered,
+            "aead_aes256_gcm_rtpsize",
+        ))
+        .unwrap();
+        let second: Value = serde_json::from_str(&select_protocol_message(
+            &discovered,
+            "aead_aes256_gcm_rtpsize",
+        ))
+        .unwrap();
+
+        let codec = &first["d"]["codecs"][0];
+        assert_eq!(codec["name"], "opus");
+        assert_eq!(codec["type"], "audio");
+        assert_eq!(codec["priority"], 1000);
+        assert_eq!(codec["payload_type"], 120);
+        assert_eq!(first["d"]["protocol"], "udp");
+        assert_eq!(first["d"]["data"]["address"], "203.0.113.7");
+        assert_eq!(first["d"]["data"]["mode"], "aead_aes256_gcm_rtpsize");
+
+        let id = first["d"]["rtc_connection_id"]
+            .as_str()
+            .expect("a connection id is sent");
+        assert_eq!(id.len(), 36, "a UUID is expected");
+        assert_ne!(
+            id,
+            second["d"]["rtc_connection_id"].as_str().unwrap(),
+            "each SELECT_PROTOCOL gets a fresh connection id"
+        );
+    }
 }

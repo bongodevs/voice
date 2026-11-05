@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
+use tokio::time::{interval_at, sleep, timeout, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
@@ -59,6 +59,13 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// close frame, so it actually reaches Discord before the task is aborted.
 const CLOSE_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
+/// How long one gateway write may take before the socket is treated as dead.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Outbound gateway messages queued for the writer task. A full queue means the gateway stopped
+/// reading, so the session is closed instead of buffering without bound.
+const WRITE_QUEUE_LEN: usize = 1024;
+
 /// Lifecycle state of a [`VoiceConnection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -101,6 +108,7 @@ type WsSink = SplitSink<WsStream, Message>;
 type WsSource = SplitStream<WsStream>;
 
 /// A DAVE event forwarded from the gateway supervisor to the send task (which owns the session).
+#[derive(Debug)]
 enum DaveEvent {
     /// A binary MLS op (25/27/29/30) with its payload.
     Binary { op: u8, payload: Vec<u8> },
@@ -117,6 +125,15 @@ enum DaveEvent {
     UsersConnected { user_ids: Vec<u64> },
     /// Op 13 `CLIENT_DISCONNECT`: a user left.
     UserDisconnected { user_id: u64 },
+    /// Op 4 `SESSION_DESCRIPTION`: the transport key/mode and DAVE version to apply.
+    SessionDescription {
+        /// The 32-byte transport secret key.
+        secret_key: Vec<u8>,
+        /// The negotiated transport mode wire name (`d.mode`).
+        mode: String,
+        /// The negotiated DAVE protocol version (`0` disables DAVE).
+        dave_protocol_version: u16,
+    },
 }
 
 /// Everything needed to join a voice channel, sourced from the main gateway's `VOICE_STATE_UPDATE`
@@ -147,8 +164,8 @@ impl VoiceServerInfo {
     }
 }
 
-/// Re-announces our speaking state on op 11/12 so clients that join after playback began get our
-/// SSRC-to-user mapping; without it late joiners hear nothing.
+/// Re-announces our speaking state on a user's stream change (op 12) and on a session description,
+/// so clients that join after playback began still map our SSRC to the bot user.
 #[derive(Clone)]
 struct SpeakingReannounce {
     ws_tx: mpsc::UnboundedSender<Message>,
@@ -397,6 +414,7 @@ impl VoiceConnection {
             dave,
             transport,
             ssrc,
+            dave_version > 0,
             ws_tx.clone(),
             dave_rx,
             dispatcher.clone(),
@@ -641,6 +659,10 @@ mod tests {
         assert_eq!(value["d"]["server_id"], "99");
         assert_eq!(value["d"]["session_id"], "sid");
         assert_eq!(value["d"]["seq_ack"], 12);
+        assert!(
+            value["d"].get("video").is_none(),
+            "the v8 resume must not carry the v5 video field"
+        );
     }
 
     #[test]
@@ -784,6 +806,10 @@ mod tests {
         let value: Value =
             serde_json::from_str(identify_message(&info("region.discord.media")).as_str()).unwrap();
         assert_eq!(value["d"]["channel_id"].as_str(), Some("3"));
+        assert!(
+            value["d"].get("video").is_none(),
+            "the v8 identify must not carry the v5 video field"
+        );
     }
 
     #[test]

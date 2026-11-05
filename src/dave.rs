@@ -48,6 +48,22 @@ impl DaveEncryptor {
         }
     }
 
+    /// Re-initialise the session for the version in a repeated `SESSION_DESCRIPTION`.
+    /// Version `0` disables DAVE and tears the group down; any other version starts a fresh
+    /// session, matching Discord's own re-key on a new description.
+    pub fn reinit_with_version(&mut self, version: u16) -> Result<(), String> {
+        if version == 0 {
+            self.reset();
+            return Ok(());
+        }
+        let version = NonZeroU16::new(version).expect("checked non-zero");
+        let user_id = self.session.user_id();
+        let channel_id = self.session.channel_id();
+        self.session
+            .reinit(version, user_id, channel_id, None)
+            .map_err(|error| error.to_string())
+    }
+
     /// Re-initialise the session for a new MLS group, Discord's new-epoch re-key.
     /// Without it the new group's proposals fail with `Wrong Epoch` or `AlreadyInGroup`.
     pub fn reinit(&mut self) -> Result<(), davey::errors::ReinitError> {
@@ -55,12 +71,6 @@ impl DaveEncryptor {
         let user_id = self.session.user_id();
         let channel_id = self.session.channel_id();
         self.session.reinit(version, user_id, channel_id, None)
-    }
-
-    /// Enable or disable passthrough mode (used during DAVE transitions / downgrades). When
-    /// disabling, davey applies the default ~10 s transition grace period.
-    pub fn set_passthrough(&mut self, enabled: bool) {
-        self.session.set_passthrough_mode(enabled, None);
     }
 
     /// Tear down the MLS group and clear key material, for a downgrade to DAVE v0.
@@ -113,6 +123,29 @@ mod tests {
 
         assert!(!encryptor.is_ready());
         assert_ne!(encryptor.status(), SessionStatus::ACTIVE);
+    }
+
+    // A repeat description re-inits the MLS session at the announced version (davey only speaks
+    // v1 today, so the change itself is not observable yet).
+    #[test]
+    fn a_session_description_reinitialises_at_its_version() {
+        let mut encryptor = DaveEncryptor::new(1234, 5678).expect("create session");
+        let version = encryptor.session().protocol_version().get();
+
+        encryptor
+            .reinit_with_version(version)
+            .expect("apply the description's version");
+
+        assert_eq!(encryptor.session().protocol_version().get(), version);
+    }
+
+    #[test]
+    fn a_zero_version_disables_dave() {
+        let mut encryptor = DaveEncryptor::new(1234, 5678).expect("create session");
+
+        encryptor.reinit_with_version(0).expect("disable DAVE");
+
+        assert_eq!(encryptor.status(), SessionStatus::INACTIVE);
     }
 
     #[test]

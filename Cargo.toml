@@ -1,6 +1,6 @@
 [package]
 name = "voice"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "Discord voice sending with Gateway v8, UDP/RTP, and DAVE (MLS) end-to-end encryption"
 license = "MIT"
@@ -17,6 +17,7 @@ davey = "0.1.4"
 futures-util = "0.3.34"
 aes-gcm = "0.10.3"
 chacha20poly1305 = "0.10.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dependencies.tokio]
 version = "1.53"
@@ -25,3 +26,6 @@ features = ["rt-multi-thread", "sync", "time", "net", "macros"]
 [dependencies.tokio-tungstenite]
 version = "0.29.0"
 features = ["rustls-tls-webpki-roots"]
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["test-util"] }

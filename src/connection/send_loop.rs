@@ -1,6 +1,21 @@
 use super::builders::speaking_message;
 use super::dave::handle_dave_event;
 use super::*;
+use crate::frame::FRAME_DURATION;
+
+// A stage that takes longer than one slot is what makes the frame clock report a stall, so the two
+// stages that run on this task say which one did it. Payload bytes are never logged.
+fn dave_event_label(event: &DaveEvent) -> &'static str {
+    match event {
+        DaveEvent::Binary { .. } => "mls",
+        DaveEvent::PrepareTransition { .. } => "prepare-transition",
+        DaveEvent::ExecuteTransition { .. } => "execute-transition",
+        DaveEvent::PrepareEpoch { .. } => "prepare-epoch",
+        DaveEvent::UsersConnected { .. } => "users-connected",
+        DaveEvent::UserDisconnected { .. } => "user-disconnected",
+        DaveEvent::SessionDescription { .. } => "session-description",
+    }
+}
 
 /// The 20 ms send task, pacing frames through the [`FramePacer`] and applying DAVE MLS messages.
 #[allow(clippy::too_many_arguments)]
@@ -10,6 +25,7 @@ pub(super) async fn send_loop<P>(
     dave: DaveEncryptor,
     transport: Box<dyn crate::transport::TransportCipher>,
     ssrc: u32,
+    dave_enabled: bool,
     ws_tx: mpsc::UnboundedSender<Message>,
     mut dave_rx: mpsc::UnboundedReceiver<DaveEvent>,
     dispatcher: EventDispatcher,
@@ -20,6 +36,7 @@ pub(super) async fn send_loop<P>(
 {
     let speaking_tx = ws_tx.clone();
     let mut pacer = FramePacer::with_transport(provider, udp, dave, transport, ssrc);
+    pacer.set_dave_enabled(dave_enabled);
     pacer.on_speaking(move |speaking| {
         // Keep the shared flag in sync so the gateway task can re-announce it on op 11/12.
         speaking_flag.store(speaking, Ordering::Relaxed);
@@ -49,8 +66,19 @@ pub(super) async fn send_loop<P>(
             break;
         }
         tokio::select! {
-            _ = clock.wait() => {
-                match pacer.tick().await {
+            missed = clock.wait() => {
+                let started = Instant::now();
+                let outcome = pacer.tick().await;
+                let tick = started.elapsed();
+                if tick > FRAME_DURATION {
+                    tracing::warn!(
+                        tick_micros = tick.as_micros() as u64,
+                        missed,
+                        dropped = clock.dropped_frames(),
+                        "voice: send tick overran its frame slot"
+                    );
+                }
+                match outcome {
                     Ok(_) => consecutive_send_errors = 0,
                     Err(error) => {
                         consecutive_send_errors += 1;
@@ -80,6 +108,38 @@ pub(super) async fn send_loop<P>(
             event = dave_rx.recv(), if dave_open => {
                 match event {
                     Some(event) => {
+                        let label = dave_event_label(&event);
+                        let started = Instant::now();
+                        // A repeated SESSION_DESCRIPTION rotates the transport key and mode. Build
+                        // the new cipher before the next frame; the old key would make Discord
+                        // drop every packet it cannot decrypt.
+                        if let DaveEvent::SessionDescription {
+                            secret_key, mode, ..
+                        } = &event
+                        {
+                            match cipher_for_mode(mode, secret_key) {
+                                Ok(cipher) => {
+                                    pacer.set_transport(cipher);
+                                    tracing::info!(%mode, "voice: transport cipher replaced");
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "voice: session description has no usable cipher"
+                                    );
+                                    // Cannot encrypt for the server, so end this connection and let
+                                    // the higher layer rebuild the voice state.
+                                    state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
+                                    dispatcher.dispatch(VoiceEvent::GatewayClosed {
+                                        code: 4900,
+                                        reason: "unsupported transport mode".into(),
+                                        by_remote: false,
+                                    });
+                                    let _ = ws_tx.send(close_message());
+                                    break;
+                                }
+                            }
+                        }
                         handle_dave_event(
                             pacer.dave_mut(),
                             &mut pending,
@@ -87,6 +147,15 @@ pub(super) async fn send_loop<P>(
                             event,
                             &ws_tx,
                         );
+                        let took = started.elapsed();
+                        if took > FRAME_DURATION {
+                            tracing::warn!(
+                                event = label,
+                                dave_micros = took.as_micros() as u64,
+                                dropped = clock.dropped_frames(),
+                                "voice: DAVE handling overran a frame slot"
+                            );
+                        }
                         // The group flipping to active means end-to-end encryption is on, so
                         // announce it once with the privacy code.
                         let ready = pacer.dave_mut().is_ready();

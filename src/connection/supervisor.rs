@@ -29,6 +29,15 @@ impl ReconnectBudget {
     }
 }
 
+/// A heartbeat interval whose first tick waits a full period, as the reference's
+/// `scheduleAtFixedRate` does. A zero period would panic, so keep at least one millisecond.
+fn heartbeat_interval(period: Duration) -> tokio::time::Interval {
+    let period = period.max(Duration::from_millis(1));
+    let mut interval = interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
+
 /// Gateway supervisor: owns the WebSocket, heartbeats, dispatches inbound ops, and resumes on a
 /// dropped connection while the send task (UDP/DAVE) keeps running.
 #[allow(clippy::too_many_arguments)]
@@ -45,23 +54,20 @@ pub(super) async fn gateway_loop(
     dispatcher: EventDispatcher,
     reannounce: SpeakingReannounce,
 ) {
-    let mut hb = interval(Duration::from_millis(heartbeat_interval_ms.max(1.0) as u64));
-    hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut nonce: u64 = 0;
+    let mut hb = heartbeat_interval(Duration::from_millis(heartbeat_interval_ms as u64));
     let mut budget = ReconnectBudget::new();
     // The handshake's session description starts the budget at zero; this covers op 4/op 9 mid-loop.
     let mut session_confirmed = false;
 
     loop {
         let outcome = pump(
-            &mut sink,
-            &mut stream,
+            sink,
+            stream,
             &mut ws_rx,
             &dave_tx,
             &dispatcher,
             &reannounce,
             &mut hb,
-            &mut nonce,
             &mut last_seq,
             &ping,
             &state,
@@ -92,7 +98,7 @@ pub(super) async fn gateway_loop(
                     tracing::debug!(code = code.unwrap_or(0), "voice: gateway closed locally");
                     break;
                 }
-                let mut recovered = false;
+                let mut recovered = None;
                 if is_resumable(code) && budget.can_attempt() {
                     // Only resume if still Connected; a concurrent `disconnect` sets Closed, and
                     // resuming would revive a connection the caller asked to drop.
@@ -105,8 +111,8 @@ pub(super) async fn gateway_loop(
                         )
                         .is_ok();
                     if !claimed {
-                        // `disconnect` raced in after the drop; flush its queued close and stop.
-                        let _ = sink.send(Message::Close(None)).await;
+                        // `disconnect` raced in after the drop; the writer has already flushed its
+                        // close.
                         return;
                     }
                     tracing::warn!(
@@ -119,21 +125,27 @@ pub(super) async fn gateway_loop(
                     // connection on the host at once, and a fixed schedule reconnects them in step.
                     while budget.can_attempt() {
                         // Nothing pumps `ws_rx` during this loop, so a `disconnect` queued there is
-                        // invisible; watch the state and flush the close frame ourselves instead of
-                        // leaking the session until Discord times it out.
+                        // invisible; watch the state instead of leaking the session until Discord
+                        // times it out.
                         if ConnectionState::from_u8(state.load(Ordering::SeqCst))
                             == ConnectionState::Closed
                         {
-                            let _ = sink.send(Message::Close(None)).await;
                             return;
                         }
                         sleep(backoff_delay(budget.attempts())).await;
                         budget.record_attempt();
-                        if let Ok((new_sink, new_stream)) = reconnect(&resume.url).await {
-                            sink = new_sink;
-                            stream = new_stream;
-                            if sink.send(resume_message(&resume, last_seq)).await.is_ok() {
-                                recovered = true;
+                        if let Ok((mut new_sink, new_stream)) = reconnect(&resume.url).await {
+                            // The resume has to finish before the new writer starts; a stalled
+                            // handshake must not pin the supervisor forever.
+                            let resumed = timeout(
+                                WRITE_TIMEOUT,
+                                new_sink.send(resume_message(&resume, last_seq)),
+                            )
+                            .await
+                            .map(|result| result.is_ok())
+                            .unwrap_or(false);
+                            if resumed {
+                                recovered = Some((new_sink, new_stream));
                                 break;
                             }
                         }
@@ -144,19 +156,24 @@ pub(super) async fn gateway_loop(
                         "voice: reconnect budget exhausted, reporting the close to the client"
                     );
                 }
-                if recovered {
-                    tracing::info!("voice: gateway session resumed");
-                    state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
-                } else {
-                    tracing::warn!(
-                        code = code.unwrap_or(1006),
-                        reason = %reason,
-                        by_remote,
-                        "voice: gateway closed"
-                    );
-                    state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
-                    dispatcher.dispatch(closed_event(code, reason, by_remote));
-                    break;
+                match recovered {
+                    Some((new_sink, new_stream)) => {
+                        sink = new_sink;
+                        stream = new_stream;
+                        tracing::info!("voice: gateway session resumed");
+                        state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
+                    }
+                    None => {
+                        tracing::warn!(
+                            code = code.unwrap_or(1006),
+                            reason = %reason,
+                            by_remote,
+                            "voice: gateway closed"
+                        );
+                        state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
+                        dispatcher.dispatch(closed_event(code, reason, by_remote));
+                        break;
+                    }
                 }
             }
         }
@@ -204,6 +221,7 @@ pub(super) fn backoff_delay(attempt: u32) -> Duration {
 }
 
 /// Outcome of one [`pump`] over a single WebSocket lifetime.
+#[derive(Debug)]
 enum PumpOutcome {
     /// The outbound channel closed (the connection was disconnected or dropped), so stop entirely.
     Stop,
@@ -218,74 +236,135 @@ enum PumpOutcome {
     },
 }
 
+/// Queue one message for the writer task without waiting. A full queue means the gateway has
+/// stopped reading, so the caller closes the session instead of buffering without bound.
+fn queue_outbound(tx: &mpsc::Sender<Message>, message: Message) -> Result<(), &'static str> {
+    match tx.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err("outbound queue full"),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err("outbound writer stopped"),
+    }
+}
+
+/// The only task that awaits a socket write. Keeping writes here means a stalled gateway cannot
+/// delay heartbeats or inbound reads, and every write has a deadline of its own.
+async fn writer_task<S>(
+    mut sink: S,
+    mut rx: mpsc::Receiver<Message>,
+    failed: mpsc::UnboundedSender<String>,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    while let Some(message) = rx.recv().await {
+        match timeout(WRITE_TIMEOUT, sink.send(message)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = failed.send(format!("outbound send failed: {error}"));
+                return;
+            }
+            Err(_) => {
+                let _ = failed.send("outbound send timed out".into());
+                return;
+            }
+        }
+    }
+    // The supervisor is stopping; give the close frame the same short grace as `disconnect`.
+    let _ = timeout(CLOSE_FLUSH_GRACE, sink.send(Message::Close(None))).await;
+}
+
 /// Drive one WebSocket until it drops or the outbound channel closes.
 #[allow(clippy::too_many_arguments)]
-async fn pump(
-    sink: &mut WsSink,
-    stream: &mut WsSource,
+async fn pump<S, R, E>(
+    sink: S,
+    mut stream: R,
     ws_rx: &mut mpsc::UnboundedReceiver<Message>,
     dave_tx: &mpsc::UnboundedSender<DaveEvent>,
     dispatcher: &EventDispatcher,
     reannounce: &SpeakingReannounce,
     hb: &mut tokio::time::Interval,
-    nonce: &mut u64,
     last_seq: &mut u64,
     ping: &Arc<AtomicU64>,
     state: &Arc<AtomicU8>,
     session_confirmed: &mut bool,
-) -> PumpOutcome {
+) -> PumpOutcome
+where
+    S: futures_util::Sink<Message> + Unpin + Send + 'static,
+    S::Error: std::fmt::Display,
+    R: futures_util::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+    E: std::fmt::Display,
+{
+    let (write_tx, write_rx) = mpsc::channel::<Message>(WRITE_QUEUE_LEN);
+    let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<String>();
+    let mut writer = tokio::spawn(writer_task(sink, write_rx, failed_tx));
+
     // When the last heartbeat was sent, used to compute the round-trip on the matching ACK (op 6).
     let mut last_heartbeat: Option<Instant> = None;
     // A gateway that stops acking is dead even though its TCP connection still reads fine, so this
     // watchdog is what stops a zombie session swallowing every frame forever.
     let mut last_ack = Instant::now();
-    let ack_timeout = hb.period() * MISSED_ACKS_BEFORE_DEAD;
-    loop {
+    let outcome = loop {
         tokio::select! {
             outbound = ws_rx.recv() => match outbound {
                 Some(message) => {
-                    if sink.send(message).await.is_err() {
-                        return PumpOutcome::Closed {
+                    if let Err(reason) = queue_outbound(&write_tx, message) {
+                        break PumpOutcome::Closed {
                             code: None,
-                            reason: "outbound send failed".into(),
+                            reason: reason.into(),
                             by_remote: false,
                         };
                     }
                 }
-                None => {
-                    let _ = sink.send(Message::Close(None)).await;
-                    return PumpOutcome::Stop;
-                }
+                None => break PumpOutcome::Stop,
+            },
+            failure = failed_rx.recv() => {
+                break PumpOutcome::Closed {
+                    code: None,
+                    reason: failure.unwrap_or_else(|| "outbound writer stopped".into()),
+                    by_remote: false,
+                };
             },
             _ = hb.tick() => {
+                // A HELLO can change the period, so read it on every tick instead of caching it.
+                let ack_timeout = hb.period() * MISSED_ACKS_BEFORE_DEAD;
                 if last_ack.elapsed() > ack_timeout {
                     tracing::warn!(
                         elapsed_ms = last_ack.elapsed().as_millis(),
                         "voice: no heartbeat ack, treating the gateway as dead"
                     );
                     // `code: None` is resumable, so the supervisor reconnects and sends op 7.
-                    return PumpOutcome::Closed {
+                    break PumpOutcome::Closed {
                         code: None,
                         reason: "heartbeat ack timeout".into(),
                         by_remote: false,
                     };
                 }
-                *nonce = nonce.wrapping_add(1);
-                if sink
-                    .send(heartbeat_message(*nonce, *last_seq))
-                    .await
-                    .is_err()
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_millis() as u64)
+                    .unwrap_or(0);
+                if let Err(reason) =
+                    queue_outbound(&write_tx, heartbeat_message(t, *last_seq))
                 {
-                    return PumpOutcome::Closed {
+                    break PumpOutcome::Closed {
                         code: None,
-                        reason: "heartbeat send failed".into(),
+                        reason: reason.into(),
                         by_remote: false,
                     };
                 }
+                // The ack gap is recorded at send time so a silent guild can be measured against
+                // the watchdog budget instead of guessed at.
+                tracing::trace!(
+                    seq_ack = *last_seq,
+                    period_ms = hb.period().as_millis(),
+                    since_ack_ms = last_ack.elapsed().as_millis(),
+                    missed_acks_before_dead = MISSED_ACKS_BEFORE_DEAD,
+                    "voice: heartbeat sent (op 3)"
+                );
                 last_heartbeat = Some(Instant::now());
             },
             inbound = stream.next() => match inbound {
-                Some(Ok(Message::Close(frame))) => return close_outcome(frame),
+                Some(Ok(Message::Close(frame))) => break close_outcome(frame),
                 Some(Ok(message)) => handle_inbound(
                     message,
                     dave_tx,
@@ -296,20 +375,21 @@ async fn pump(
                     ping,
                     last_heartbeat,
                     &mut last_ack,
+                    hb,
                     session_confirmed,
                 ),
                 Some(Err(error)) => {
                     dispatcher.dispatch(VoiceEvent::GatewayError {
                         message: error.to_string(),
                     });
-                    return PumpOutcome::Closed {
+                    break PumpOutcome::Closed {
                         code: None,
                         reason: "connection error".into(),
                         by_remote: false,
                     };
                 }
                 None => {
-                    return PumpOutcome::Closed {
+                    break PumpOutcome::Closed {
                         code: None,
                         reason: String::new(),
                         by_remote: false,
@@ -317,7 +397,15 @@ async fn pump(
                 }
             },
         }
+    };
+
+    // Let the writer drain what is already queued, then stop it rather than block on a stuck
+    // socket. Closing the channel makes it emit the close frame first.
+    drop(write_tx);
+    if timeout(CLOSE_FLUSH_GRACE, &mut writer).await.is_err() {
+        writer.abort();
     }
+    outcome
 }
 
 /// Translate a WebSocket close frame into a [`PumpOutcome`].
@@ -348,13 +436,16 @@ fn handle_inbound(
     ping: &Arc<AtomicU64>,
     last_heartbeat: Option<Instant>,
     last_ack: &mut Instant,
+    hb: &mut tokio::time::Interval,
     session_confirmed: &mut bool,
 ) {
     match message {
         // Binary header: seq (2, BE) + op (1) + MLS payload.
         Message::Binary(bytes) => {
             if bytes.len() >= 2 {
-                *last_seq = (*last_seq).max(u16::from_be_bytes([bytes[0], bytes[1]]) as u64);
+                // The wire sequence is 16-bit and wraps, so the latest value must win even when it
+                // is numerically smaller than the previous one.
+                *last_seq = u16::from_be_bytes([bytes[0], bytes[1]]) as u64;
             }
             forward_dave_binary(&bytes, dave_tx);
         }
@@ -362,8 +453,8 @@ fn handle_inbound(
             let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
                 return;
             };
-            if let Some(s) = value["seq"].as_u64() {
-                *last_seq = (*last_seq).max(s);
+            if let Some(seq) = value["seq"].as_u64() {
+                *last_seq = seq;
             }
             let d = &value["d"];
             let Some(op) = value["op"].as_u64() else {
@@ -371,15 +462,42 @@ fn handle_inbound(
             };
             forward_dave_json(op, d, dave_tx);
             match op {
-                // Op 4 `SESSION_DESCRIPTION`: a fresh session, so the reconnect budget is restored.
+                // Op 4 `SESSION_DESCRIPTION`: a fresh session, so the reconnect budget is
+                // restored. The transport key/mode can rotate on a repeated description, so the
+                // send task has to rebuild its cipher instead of keeping the handshake's key.
                 4 => {
                     *session_confirmed = true;
+                    match session_description_event(d) {
+                        Some(event) => {
+                            let _ = dave_tx.send(event);
+                        }
+                        None => tracing::warn!(
+                            "voice: session description without a usable mode or key"
+                        ),
+                    }
+                    // The reference refreshes the speaking/SSRC mapping on every description.
+                    reannounce.announce_if_speaking();
                 }
                 // Op 6 `HEARTBEAT_ACK`: record the round-trip since the last heartbeat as the ping.
                 6 => {
+                    let since_previous_ack = last_ack.elapsed();
                     *last_ack = Instant::now();
                     if let Some(sent) = last_heartbeat {
-                        ping.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let round_trip = sent.elapsed();
+                        ping.store(round_trip.as_millis() as u64, Ordering::Relaxed);
+                        tracing::trace!(
+                            round_trip_ms = round_trip.as_millis(),
+                            since_previous_ack_ms = since_previous_ack.as_millis(),
+                            "voice: heartbeat ack received (op 6)"
+                        );
+                    }
+                }
+                // Op 8 `HELLO`: the announced cadence can change on a repeated HELLO, so rebuild
+                // the interval and give the new period a fresh ACK window.
+                8 => {
+                    if let Some(interval) = d["heartbeat_interval"].as_u64() {
+                        *hb = heartbeat_interval(Duration::from_millis(interval));
+                        *last_ack = Instant::now();
                     }
                 }
                 // Op 9 `RESUMED`: mark the session connected again and restore the reconnect budget.
@@ -399,8 +517,6 @@ fn handle_inbound(
                             });
                         }
                     }
-                    // A client joined: re-announce speaking so it maps our SSRC and hears us.
-                    reannounce.announce_if_speaking();
                 }
                 // Op 12 `VIDEO`: a single user's stream SSRCs changed (carries `user_id` +
                 // `audio_ssrc`).
@@ -411,7 +527,7 @@ fn handle_inbound(
                             audio_ssrc: d["audio_ssrc"].as_u64().unwrap_or(0) as u32,
                         });
                     }
-                    // A client joined: re-announce speaking so it maps our SSRC and hears us.
+                    // A user's stream changed: refresh our SSRC mapping, as the reference does.
                     reannounce.announce_if_speaking();
                 }
                 // Op 13 `CLIENT_DISCONNECT`.
@@ -427,6 +543,25 @@ fn handle_inbound(
         }
         _ => {}
     }
+}
+
+/// Build the event that carries a repeated `SESSION_DESCRIPTION`'s transport and DAVE settings.
+/// `None` when the payload has no mode or no key, in which case the old cipher has to stay.
+fn session_description_event(d: &Value) -> Option<DaveEvent> {
+    let mode = d["mode"].as_str()?.to_string();
+    let secret_key: Vec<u8> = d["secret_key"]
+        .as_array()?
+        .iter()
+        .filter_map(|n| n.as_u64().map(|x| x as u8))
+        .collect();
+    if secret_key.is_empty() {
+        return None;
+    }
+    Some(DaveEvent::SessionDescription {
+        secret_key,
+        mode,
+        dave_protocol_version: d["dave_protocol_version"].as_u64().unwrap_or(0) as u16,
+    })
 }
 
 /// Forward a binary MLS op (`[seq: u16 BE][op: u8][mls…]`) to the send task, which owns the DAVE
@@ -504,6 +639,68 @@ pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+    use futures_util::StreamExt;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// A sink whose writes block after `free` frames, so a test can hold the writer mid-write.
+    struct GatedSink {
+        sent: mpsc::UnboundedSender<Message>,
+        free: usize,
+        written: usize,
+        stall: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl GatedSink {
+        fn new(free: usize) -> (Self, mpsc::UnboundedReceiver<Message>) {
+            let (sent, rx) = mpsc::unbounded_channel();
+            (
+                Self {
+                    sent,
+                    free,
+                    written: 0,
+                    stall: Box::pin(sleep(Duration::from_secs(3_600))),
+                },
+                rx,
+            )
+        }
+    }
+
+    impl futures_util::Sink<Message> for GatedSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            if self.written >= self.free {
+                return self.stall.as_mut().poll(cx).map(|_| Ok(()));
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.written += 1;
+            self.sent
+                .send(item)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     // Three successful reconnects in a row must not exhaust the budget.
     #[test]
@@ -535,8 +732,8 @@ mod tests {
     }
 
     // Op 4 and op 9 both confirm the session, which is what restores the budget.
-    #[test]
-    fn session_description_and_resumed_confirm_the_session() {
+    #[tokio::test]
+    async fn session_description_and_resumed_confirm_the_session() {
         for op in [4u64, 9] {
             let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
             let dispatcher = EventDispatcher::new();
@@ -550,6 +747,7 @@ mod tests {
             let ping = Arc::new(AtomicU64::new(0));
             let mut last_seq: u64 = 0;
             let mut last_ack = Instant::now();
+            let mut hb = heartbeat_interval(Duration::from_millis(41_250));
             let mut confirmed = false;
             let payload = format!(r#"{{"op":{op},"d":{{}}}}"#);
 
@@ -563,11 +761,179 @@ mod tests {
                 &ping,
                 None,
                 &mut last_ack,
+                &mut hb,
                 &mut confirmed,
             );
 
             assert!(confirmed, "op {op} must confirm the session");
         }
+    }
+
+    // HELLO can arrive mid-connection with a new interval; the reference rebuilds its fixed-rate
+    // schedule from that point. The first beat of either schedule waits a full period.
+    #[tokio::test]
+    async fn hello_rearms_the_heartbeat_interval() {
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq: u64 = 0;
+        let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+        let mut confirmed = false;
+
+        assert!(
+            hb.tick().now_or_never().is_none(),
+            "the first heartbeat must wait one full interval"
+        );
+
+        handle_inbound(
+            Message::text(json!({"op": 8, "d": {"heartbeat_interval": 30_000}}).to_string()),
+            &dave_tx,
+            &dispatcher,
+            &reannounce,
+            &state,
+            &mut last_seq,
+            &ping,
+            None,
+            &mut last_ack,
+            &mut hb,
+            &mut confirmed,
+        );
+
+        assert_eq!(
+            hb.period(),
+            Duration::from_millis(30_000),
+            "op 8 must replace the old heartbeat interval"
+        );
+        assert!(
+            hb.tick().now_or_never().is_none(),
+            "the re-armed heartbeat must also wait one full interval"
+        );
+    }
+
+    // A repeated op 4 rotates the transport key/mode and the DAVE version. Without forwarding it,
+    // the send task keeps encrypting with the stale key and Discord drops every frame.
+    #[tokio::test]
+    async fn a_repeated_session_description_forwards_the_new_cipher() {
+        let (dave_tx, mut dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq: u64 = 0;
+        let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+        let mut confirmed = false;
+        let payload = json!({
+            "op": 4,
+            "d": {
+                "mode": "aead_aes256_gcm_rtpsize",
+                "secret_key": vec![7u8; 32],
+                "dave_protocol_version": 1,
+            }
+        })
+        .to_string();
+
+        handle_inbound(
+            Message::text(payload),
+            &dave_tx,
+            &dispatcher,
+            &reannounce,
+            &state,
+            &mut last_seq,
+            &ping,
+            None,
+            &mut last_ack,
+            &mut hb,
+            &mut confirmed,
+        );
+
+        assert!(confirmed, "op 4 still confirms the session");
+        match dave_rx.try_recv() {
+            Ok(DaveEvent::SessionDescription {
+                secret_key,
+                mode,
+                dave_protocol_version,
+            }) => {
+                assert_eq!(secret_key, vec![7u8; 32]);
+                assert_eq!(mode, "aead_aes256_gcm_rtpsize");
+                assert_eq!(dave_protocol_version, 1);
+            }
+            other => panic!("expected a session-description event, got {other:?}"),
+        }
+    }
+
+    // The inbound sequence is 16-bit and wraps; acking the maximum would pin seq_ack at 65535.
+    #[tokio::test]
+    async fn sequence_tracks_the_latest_value_across_a_wrap() {
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq: u64 = 0;
+        let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+        let mut confirmed = false;
+
+        for seq in [65_535u16, 1] {
+            handle_inbound(
+                Message::Binary(bytes::Bytes::from(vec![(seq >> 8) as u8, seq as u8, 0])),
+                &dave_tx,
+                &dispatcher,
+                &reannounce,
+                &state,
+                &mut last_seq,
+                &ping,
+                None,
+                &mut last_ack,
+                &mut hb,
+                &mut confirmed,
+            );
+        }
+        assert_eq!(last_seq, 1, "the latest sequence must win after a wrap");
+
+        let value: serde_json::Value = serde_json::from_str(
+            heartbeat_message(1_700_000_000_000, last_seq)
+                .into_text()
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(value["d"]["seq_ack"], 1);
+        assert_eq!(value["d"]["t"], 1_700_000_000_000u64);
+
+        let resume = ResumeInfo {
+            url: "wss://x/?v=8".into(),
+            server_id: 9,
+            session_id: "sid".into(),
+            token: "tok".into(),
+        };
+        let value: serde_json::Value = serde_json::from_str(
+            resume_message(&resume, last_seq)
+                .into_text()
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(value["d"]["seq_ack"], 1);
     }
 
     #[test]
@@ -607,5 +973,199 @@ mod tests {
             }
             other => panic!("expected a gateway close, got {other:?}"),
         }
+    }
+
+    // A blocked socket write must not stop inbound ops from being handled: the writer is stuck on
+    // its first frame while op 9 lands and flips the state back to Connected.
+    #[tokio::test]
+    async fn a_blocked_write_does_not_stop_inbound_reads() {
+        let (sink, mut written) = GatedSink::new(0);
+        let stream = futures_util::stream::once(async {
+            sleep(Duration::from_millis(5)).await;
+            Ok::<_, std::io::Error>(Message::text(json!({"op": 9, "d": {}}).to_string()))
+        })
+        .chain(futures_util::stream::pending::<
+            Result<Message, std::io::Error>,
+        >())
+        .boxed();
+
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
+        ws_tx.send(Message::text("outbound")).unwrap();
+
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Reconnecting as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+
+        let task = tokio::spawn({
+            let state = state.clone();
+            let ping = ping.clone();
+            async move {
+                let mut last_seq = 0;
+                let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+                let mut confirmed = false;
+                pump(
+                    sink,
+                    stream,
+                    &mut ws_rx,
+                    &dave_tx,
+                    &dispatcher,
+                    &reannounce,
+                    &mut hb,
+                    &mut last_seq,
+                    &ping,
+                    &state,
+                    &mut confirmed,
+                )
+                .await
+            }
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.load(Ordering::SeqCst),
+            ConnectionState::Connected as u8,
+            "inbound op 9 must be handled while the writer is blocked"
+        );
+        assert!(
+            written.try_recv().is_err(),
+            "the gated sink must not have accepted a write"
+        );
+
+        drop(ws_tx);
+        let outcome = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("pump stops after the outbound channel closes")
+            .expect("pump task");
+        assert!(matches!(outcome, PumpOutcome::Stop));
+    }
+
+    // A write that never completes must fail at the write deadline instead of pinning the writer.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_write_times_out() {
+        let (sink, _written) = GatedSink::new(0);
+        let (write_tx, write_rx) = mpsc::channel(1);
+        let (failed_tx, mut failed_rx) = mpsc::unbounded_channel();
+        write_tx.send(Message::text("stuck")).await.unwrap();
+        let task = tokio::spawn(writer_task(sink, write_rx, failed_tx));
+
+        tokio::time::advance(WRITE_TIMEOUT + Duration::from_millis(1)).await;
+        let reason = failed_rx.recv().await.expect("a failure is reported");
+        assert_eq!(reason, "outbound send timed out");
+        task.await.unwrap();
+    }
+
+    // If the gateway stops reading, the bounded queue fills and the session closes rather than
+    // buffering every frame while the writer is stuck.
+    #[tokio::test]
+    async fn a_full_write_queue_closes_without_waiting() {
+        let (sink, _written) = GatedSink::new(0);
+        let stream = futures_util::stream::pending::<Result<Message, std::io::Error>>();
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
+        for _ in 0..WRITE_QUEUE_LEN + 2 {
+            ws_tx.send(Message::text("frame")).unwrap();
+        }
+
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: 0,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq = 0u64;
+        let mut confirmed = false;
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            pump(
+                sink,
+                stream,
+                &mut ws_rx,
+                &dave_tx,
+                &dispatcher,
+                &reannounce,
+                &mut hb,
+                &mut last_seq,
+                &ping,
+                &state,
+                &mut confirmed,
+            ),
+        )
+        .await
+        .expect("a full queue must close without waiting for the stalled write");
+
+        match outcome {
+            PumpOutcome::Closed { reason, .. } => {
+                assert_eq!(reason, "outbound queue full");
+            }
+            other => panic!("expected a closed gateway, got {other:?}"),
+        }
+    }
+
+    // The reference re-announces speaking on a user's stream change (op 12) and on a session
+    // description, but not on CLIENT_CONNECT (op 11).
+    #[tokio::test]
+    async fn speaking_is_reannounced_on_stream_changes_and_descriptions() {
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, mut speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(true)),
+            ssrc: 77,
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq = 0u64;
+        let mut last_ack = Instant::now();
+        let mut hb = heartbeat_interval(Duration::from_millis(41_250));
+        let mut confirmed = false;
+
+        let mut inbound = |payload: Value| {
+            handle_inbound(
+                Message::text(payload.to_string()),
+                &dave_tx,
+                &dispatcher,
+                &reannounce,
+                &state,
+                &mut last_seq,
+                &ping,
+                None,
+                &mut last_ack,
+                &mut hb,
+                &mut confirmed,
+            );
+        };
+
+        inbound(json!({"op": 11, "d": {"user_ids": ["1"]}}));
+        assert!(
+            speak_rx.try_recv().is_err(),
+            "op 11 must not re-announce speaking"
+        );
+
+        inbound(json!({"op": 12, "d": {"user_id": "1", "audio_ssrc": 5}}));
+        let message = speak_rx.try_recv().expect("op 12 re-announces speaking");
+        let value: Value = serde_json::from_str(message.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(value["op"], 5);
+        assert_eq!(value["d"]["speaking"], 1);
+        assert_eq!(value["d"]["ssrc"], 77);
+
+        inbound(json!({"op": 4, "d": {}}));
+        let message = speak_rx
+            .try_recv()
+            .expect("a session description re-announces speaking");
+        let value: Value = serde_json::from_str(message.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(value["op"], 5);
     }
 }

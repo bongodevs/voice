@@ -55,12 +55,20 @@ impl FrameClock {
         // simply runs now.
         let missed = ((now - self.next).as_nanos() / FRAME_DURATION.as_nanos()) as u64;
         self.next = if missed > MAX_CATCHUP_FRAMES {
-            tracing::warn!(missed, "voice: frame clock stalled, resynchronising");
             now + FRAME_DURATION
         } else {
             self.next + FRAME_DURATION
         };
         self.dropped = self.dropped.saturating_add(missed);
+        if missed > MAX_CATCHUP_FRAMES {
+            // The cumulative count separates a one-off hitch from a connection that is losing
+            // seconds of audio and needs the slow-stage logs to say which stage.
+            tracing::warn!(
+                missed,
+                dropped = self.dropped,
+                "voice: frame clock stalled, resynchronising"
+            );
+        }
         missed
     }
 
@@ -94,6 +102,8 @@ pub struct FramePacer<P: OpusFrameProvider, S: FrameSink> {
     packet: Vec<u8>,
     silence_left: u8,
     speaking: bool,
+    // Whether the session description negotiated DAVE, so plaintext audio must not go out.
+    dave_enabled: bool,
     on_speaking: Option<Box<dyn FnMut(bool) + Send>>,
 }
 
@@ -122,8 +132,20 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
             packet: Vec::with_capacity(MAX_PACKET_BYTES),
             silence_left: 0,
             speaking: false,
+            dave_enabled: false,
             on_speaking: None,
         }
+    }
+
+    /// Replace the transport cipher, e.g. after a repeated `SESSION_DESCRIPTION` rotates the key.
+    /// The RTP sequence and timestamp keep running; only the transport key/mode changes.
+    pub fn set_transport(&mut self, transport: Box<dyn TransportCipher>) {
+        self.transport = transport;
+    }
+
+    /// Mark whether DAVE was negotiated for this session.
+    pub fn set_dave_enabled(&mut self, enabled: bool) {
+        self.dave_enabled = enabled;
     }
 
     /// Register a callback invoked when the speaking state changes (send a gateway `SPEAKING`
@@ -148,8 +170,15 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         if let Some(frame) = self.provider.provide() {
             self.set_speaking(true);
             self.silence_left = SILENCE_FRAME_COUNT;
+            // A negotiated DAVE session waits for the MLS group before sending real audio; until
+            // then the slot carries the Opus silence frame, never plaintext.
+            let payload: &[u8] = if self.dave_enabled && !self.dave.is_ready() {
+                &OPUS_SILENCE_FRAME
+            } else {
+                &frame
+            };
             // `false` => active-group encryption failed; drop the frame rather than leak plaintext.
-            if self.build_packet(&frame) {
+            if self.build_packet(payload) {
                 self.send().await?;
             } else {
                 // Dropped frames still occupy their 20 ms slot: keep the RTP clock on wall time.
@@ -226,6 +255,67 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::VecSink;
+    use crate::transport::AesGcmRtpSize;
+
+    // A repeated SESSION_DESCRIPTION rotates the key; the next frame must use the new cipher.
+    #[tokio::test]
+    async fn a_replaced_transport_encrypts_the_next_frame() {
+        let sink = VecSink::new();
+        let mut frames = vec![
+            bytes::Bytes::from_static(b"frame"),
+            bytes::Bytes::from_static(b"frame"),
+        ];
+        let dave = DaveEncryptor::new(1, 2).expect("create session");
+        let mut pacer = FramePacer::new(move || frames.pop(), sink.clone(), dave, 0x1234);
+
+        assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Sent);
+        assert_eq!(
+            sink.packets().pop().expect("plaintext packet").len(),
+            RTP_HEADER_LEN + 5,
+            "the initial transport is plaintext"
+        );
+
+        pacer.set_transport(Box::new(AesGcmRtpSize::new(&[7u8; 32]).expect("cipher")));
+        assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Sent);
+        assert_eq!(
+            sink.packets().pop().expect("encrypted packet").len(),
+            RTP_HEADER_LEN + 5 + 16 + 4,
+            "tag and nonce suffix come from the replacement cipher"
+        );
+    }
+
+    // A negotiated DAVE session must not send real audio in the clear while the MLS group is
+    // still inactive; it sends the Opus silence frame in the same slot instead.
+    #[tokio::test]
+    async fn negotiated_dave_sends_silence_until_the_group_is_ready() {
+        let sink = VecSink::new();
+        let mut frames = vec![bytes::Bytes::from_static(b"audio")];
+        let dave = DaveEncryptor::new(1, 2).expect("create session");
+        let mut pacer = FramePacer::new(move || frames.pop(), sink.clone(), dave, 0x1234);
+        pacer.set_dave_enabled(true);
+
+        assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Sent);
+        let packet = sink.packets().pop().expect("packet");
+        assert_eq!(
+            &packet[RTP_HEADER_LEN..],
+            &OPUS_SILENCE_FRAME,
+            "plaintext audio leaked before DAVE was ready"
+        );
+    }
+
+    // Without DAVE there is no group to wait for, so the frame passes through unchanged.
+    #[tokio::test]
+    async fn without_dave_the_frame_passes_through() {
+        let sink = VecSink::new();
+        let mut frames = vec![bytes::Bytes::from_static(b"audio")];
+        let dave = DaveEncryptor::new(1, 2).expect("create session");
+        let mut pacer = FramePacer::new(move || frames.pop(), sink.clone(), dave, 0x1234);
+
+        assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Sent);
+        let packet = sink.packets().pop().expect("packet");
+        assert_eq!(&packet[RTP_HEADER_LEN..], b"audio");
+    }
 
     #[tokio::test]
     async fn frame_clock_catches_up_a_late_slot_then_resynchronises() {
